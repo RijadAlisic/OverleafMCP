@@ -18,15 +18,12 @@ An MCP (Model Context Protocol) server that provides full read/write access to O
 
 1. Clone this repository
 2. Install dependencies:
-   ```bash
-   npm install
-
+```bash
+npm install
 ```
-
 3. Set up your projects configuration:
 ```bash
 cp projects.example.json projects.json
-
 ```
 
 
