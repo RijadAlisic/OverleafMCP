@@ -1,6 +1,6 @@
 # Overleaf MCP — Reference Index (v1.9)
 
-Start server: `node /home/rijad/OverleafMCP/overleaf-mcp-server.js`
+Start server: `node /home/%USER%/OverleafMCP/overleaf-mcp-server.js`
 Projects: `projects.json` — omit `projectName` to use `"default"`.
 
 **If the project has a `NOTES.md` at its root, load it first.**
