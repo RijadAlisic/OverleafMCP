@@ -2,15 +2,17 @@
 
 *Originally forked from [mjyoo2](https://github.com/mjyoo2)*
 
-An MCP (Model Context Protocol) server that provides full read/write access to Overleaf projects via Git integration. This allows Claude and other MCP clients to read LaTeX files, analyze document structure, edit content, manage preambles, and reorganize sections directly within your Overleaf projects.
+An MCP (Model Context Protocol) server that provides full read/write access to Overleaf projects via Git integration. Allows Claude and other MCP clients to read LaTeX files, analyse document structure, edit content, manage preambles, reorganise sections, and manage bibliography entries directly within your Overleaf projects.
 
 ## Features
 
-- 📄 **File Management**: Create, read, delete, and list files across your Overleaf projects.
+- 📄 **File Management**: Create, read, copy, delete, and list files across your Overleaf projects.
 - ✍️ **Surgical Editing**: Read and write specific sections, subsections, and paragraphs without touching the rest of the document.
-- 🏗️ **Structural Control**: Move and insert sections or paragraphs to reorganize your paper atomically.
+- 🏗️ **Structural Control**: Move and insert sections or paragraphs to reorganise your paper atomically.
 - ⚙️ **Preamble Management**: Isolate and edit document setup (packages, custom commands) safely.
-- 🔍 **Semantic Search**: Search paragraphs by keywords to quickly find and edit relevant topics.
+- 📚 **BibTeX Management**: Search entries by any field, retrieve by citation key, and replace individual entries in-place.
+- 🔍 **Semantic Search**: Search paragraphs by keywords to quickly find and edit relevant content.
+- 🔁 **Paragraph Deduplication**: Automatically detect and rename duplicate `\paragraph{}` names.
 - 📊 **Project Summary**: Get an overview of project status and structure.
 - 🔄 **Auto-Sync**: Every write operation automatically pulls the latest state and pushes changes immediately to Overleaf.
 
@@ -25,8 +27,6 @@ npm install
 ```bash
 cp projects.example.json projects.json
 ```
-
-
 4. Edit `projects.json` with your Overleaf credentials:
 ```json
 {
@@ -38,157 +38,135 @@ cp projects.example.json projects.json
     }
   }
 }
-
 ```
-
-
 
 ## Getting Overleaf Credentials
 
-1. **Git Token**:
-* Go to Overleaf Account Settings → Git Integration
-* Click "Create Token"
-
-
-2. **Project ID**:
-* Open your Overleaf project
-* Find it in the URL: `https://www.overleaf.com/project/[PROJECT_ID]`
-
-
+1. **Git Token**: Go to Overleaf Account Settings → Git Integration → Create Token
+2. **Project ID**: Open your project — it's in the URL: `https://www.overleaf.com/project/[PROJECT_ID]`
 
 ## Claude Desktop Setup
 
-Add to your Claude Desktop configuration file:
+Add to your Claude Desktop config:
 
-**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-
-**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-
-**Linux**: `~/.config/claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Linux**: `~/.config/claude/claude_desktop_config.json`
 
 ```json
 {
   "mcpServers": {
     "overleaf": {
       "command": "node",
-      "args": [
-        "/absolute/path/to/OverleafMCP/overleaf-mcp-server.js"
-      ]
+      "args": ["/absolute/path/to/OverleafMCP/overleaf-mcp-server.js"]
     }
   }
 }
-
 ```
 
 Restart Claude Desktop after configuration.
 
-## Heading Hierarchy
-
-The server understands 4 levels of LaTeX document hierarchy via the `sectionType` argument:
-
-1. `\section{...}` (`"section"`)
-2. `\subsection{...}` (`"subsection"`)
-3. `\subsubsection{...}` (`"subsubsection"`)
-4. `\paragraph{...}` (`"paragraph"`)
-
-*Note: Starred headings (e.g., \section*{...}) are matched correctly.*
-
 ## Available Tools
 
 ### File Management
+| Tool | Description |
+|---|---|
+| `list_projects` | List all configured projects |
+| `status_summary` | Project overview: file count and heading breakdown |
+| `list_files` | List files (optional `extension`, default `.tex`; use `.bib` for bib files) |
+| `read_file` | Read a file's full contents |
+| `create_file` | Create a new file |
+| `copy_file` | Copy a file server-side (no content passes through the agent) |
+| `delete_file` | Delete a file via `git rm` |
 
-* **`list_projects`**: List all configured projects.
-* **`status_summary`**: Get a comprehensive project status summary.
-* **`list_files`**: List files in a project (Optional: `extension`).
-* **`read_file`**: Read a specific file (Required: `filePath`).
-* **`create_file`**: Create a new file (Required: `filePath`; Optional: `content`, `commitMessage`).
-* **`delete_file`**: Delete a file (Required: `filePath`; Optional: `commitMessage`).
+### Preamble
+| Tool | Description |
+|---|---|
+| `get_preamble` | Read everything before `\begin{document}` |
+| `write_preamble` | Replace the preamble — body is preserved exactly. Must NOT include `\begin{document}`. |
 
-### Preamble Management
+### Sections & Paragraphs
+| Tool | Description |
+|---|---|
+| `get_sections` | List headings (optional `sectionType` filter) |
+| `get_section_content` | Read a named heading block |
+| `write_section` | Replace a heading block in-place. `newContent` must include the heading line. |
+| `move_section` | Atomically cut and splice a block before/after another |
+| `insert_section` | Insert a new block before/after a named heading |
+| `dedup_paragraphs` | Find and rename duplicate `\paragraph{}` names (supports `dryRun`) |
 
-*Only works on root `.tex` files containing \begin{document}.*
-
-* **`get_preamble`**: Returns everything before \begin{document} (packages, document class, commands).
-* **`write_preamble`**: Overwrites the preamble. *Note: The new preamble must NOT include \begin{document}; the document body is preserved exactly.*
-
-### Section / Paragraph (Read & Write)
-
-* **`get_sections`**: Get all sections from a LaTeX file. (Optional: `sectionType` to change granularity).
-* **`get_section_content`**: Get the content of a specific section (Required: `filePath`, `sectionTitle`).
-* **`write_section`**: Overwrite a specific section block. *Note: `newContent` must include the opening heading line.*
-
-### Section / Paragraph (Structural)
-
-* **`move_section`**: Cuts a `sourceTitle` block and splices it before or after an `anchorTitle` atomically. (Required: `filePath`, `sourceTitle`, `anchorTitle`, `position`).
-* **`insert_section`**: Inserts a brand-new block before or after an `anchorTitle`. (Required: `filePath`, `anchorTitle`, `newContent`, `position`).
+### BibTeX
+| Tool | Description |
+|---|---|
+| `search_bib_entries` | Partial case-insensitive search across all fields or scoped to one (e.g. `field:"title"`) |
+| `get_bib_entry` | Retrieve a single entry by citation key |
+| `write_bib_entry` | Replace a single entry in-place — nothing else in the file is touched |
 
 ### Search
+| Tool | Description |
+|---|---|
+| `search_paragraphs` | Search paragraphs by keywords; returns matches with section breadcrumb. `matchAll:true` for AND logic. |
 
-* **`search_paragraphs`**: Returns matching paragraphs and their breadcrumb location in the document hierarchy. (Required: `filePath`, `keywords`; Optional: `matchAll` for AND logic, default is OR).
+*All tools accept an optional `projectName` argument. Omit to use `"default"`.*
 
-*(Note: All tools accept an optional `projectName` argument to target a specific project from your `projects.json`. If omitted, it defaults to `"default"`.)*
+## Heading Hierarchy
 
-## Canonical Workflows
+```
+\section{}           level 1  ("section")
+  \subsection{}      level 2  ("subsection")
+    \subsubsection{} level 3  ("subsubsection")
+      \paragraph{}   level 4  ("paragraph")
+```
 
-### Inspect & Edit the Preamble
+Starred headings (`\section*{...}`) are matched correctly. A block ends at the next heading of equal or higher level.
 
-1. Use `get_preamble` with `filePath:"main.tex"`
-2. Edit the returned string locally
-3. Use `write_preamble` with `filePath:"main.tex"` and `newPreamble:"..."`
+## Paragraph naming convention
 
-### Edit a Specific Section
+Use `\paragraph{Descriptive Name}` for all atomic searchable blocks. Names should be unique within a file — run `dedup_paragraphs` after any restructure or paste. The tool keeps the first occurrence and appends ` 2`, ` 3`, … to duplicates.
 
-1. Use `get_section_content` with `filePath:"main.tex"`, `sectionTitle:"Methodology"`
-2. Make your edits
-3. Use `write_section` with `filePath:"main.tex"`, `sectionTitle:"Methodology"`, `newContent:"..."`
+## Agent reference files
 
-### Reorder Document Structure
+The `ref/` folder contains focused reference files for Claude to load on demand — one per topic — rather than reading everything at once:
 
-Use `move_section` with:
+| File | Topic |
+|---|---|
+| `CLAUDE_REFERENCE.md` | Index — load this first |
+| `ref/files.md` | File tools |
+| `ref/preamble.md` | Preamble tools |
+| `ref/sections.md` | Section/paragraph tools |
+| `ref/paragraphs.md` | Paragraph naming & dedup |
+| `ref/search.md` | Paragraph search |
+| `ref/bibtex.md` | BibTeX tools |
+| `ref/project-notes.md` | Project-level NOTES.md convention |
+| `ref/dev.md` | Adding/modifying tools |
 
-* `sourceTitle`: "Secondary Findings"
-* `anchorTitle`: "Primary Findings"
-* `position`: "after"
-* `sectionType`: "subsection"
-
-## Important Notes & Best Practices
-
-* **Relative Paths**: All `filePath` values are relative to the project root.
-* **Immediate Syncing**: Every write operation pulls the latest state before writing—no manual sync needed. Changes appear in Overleaf immediately after the tool runs.
-* **Formatting**: When writing LaTeX via the tools, do not wrap long lines manually; maintain one paragraph per line for optimal Overleaf compatibility.
+A `NOTES_TEMPLATE.md` is also included — copy it into your Overleaf project as `NOTES.md` and keep it updated so agents can orient themselves without rediscovering the structure each session.
 
 ## Multi-Project Usage
-
-To work with multiple projects, add them to `projects.json`:
 
 ```json
 {
   "projects": {
-    "default": {
-      "name": "Main Paper",
-      "projectId": "project-id-1",
-      "gitToken": "token-1"
-    },
-    "paper2": {
-      "name": "Second Paper", 
-      "projectId": "project-id-2",
-      "gitToken": "token-2"
-    }
+    "default": { "name": "Main Paper", "projectId": "id-1", "gitToken": "token-1" },
+    "paper2":  { "name": "Second Paper", "projectId": "id-2", "gitToken": "token-2" }
   }
 }
-
 ```
 
-Then specify the project in tool calls:
-Use `get_section_content` with `projectName: "paper2"`, `filePath: "main.tex"`, `sectionTitle: "Methods"`
+Then pass `projectName:"paper2"` to any tool.
 
-## Security Notes
+## Important Notes
 
-* `projects.json` is gitignored to protect your credentials.
-* Never commit real project IDs or Git tokens.
-* Use the provided `projects.example.json` as a template.
+- All `filePath` values are relative to the project root
+- Every write pulls latest state before writing — no manual sync needed
+- Do not wrap long lines in LaTeX content — one paragraph per line
+- `projects.json` is gitignored — never commit real credentials
+
+## Security
+
+- `projects.json` is gitignored to protect your credentials
+- Use `projects.example.json` as a template
 
 ## License
 
 MIT License
-
