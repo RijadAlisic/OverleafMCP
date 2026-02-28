@@ -279,8 +279,142 @@ class OverleafGitClient {
     return results;
   }
 
+  // ── BibTeX helpers ───────────────────────────────────────────────────────
+
+  /**
+   * Parse all BibTeX entries from content.
+   * Returns array of { key, type, fields, rawText, start, end }
+   */
+  _parseBibEntries(content) {
+    const entries = [];
+    // Match @type{key, ... } — handles nested braces
+    const typeKeyRe = /@(\w+)\s*\{\s*([^,\s]+)\s*,/g;
+    let m;
+    while ((m = typeKeyRe.exec(content)) !== null) {
+      const entryStart = m.index;
+      // Walk forward to find the matching closing brace
+      let depth = 0;
+      let i = entryStart;
+      let started = false;
+      while (i < content.length) {
+        if (content[i] === '{') { depth++; started = true; }
+        else if (content[i] === '}') { depth--; }
+        if (started && depth === 0) { i++; break; }
+        i++;
+      }
+      const rawText = content.substring(entryStart, i);
+      const fields  = {};
+      // Parse fields: name = {value} or name = "value" or name = number
+      const fieldRe = /(\w+)\s*=\s*(?:\{([^]*?)\}|"([^"]*)"|([\w\d]+))\s*[,}]/g;
+      let fm;
+      // search within rawText after the first comma
+      const bodyStart = rawText.indexOf(',') + 1;
+      const body = rawText.substring(bodyStart);
+      while ((fm = fieldRe.exec(body)) !== null) {
+        const fname = fm[1].toLowerCase();
+        const fval  = fm[2] !== undefined ? fm[2] : (fm[3] !== undefined ? fm[3] : fm[4]);
+        fields[fname] = fval;
+      }
+      entries.push({
+        key:     m[2],
+        type:    m[1].toLowerCase(),
+        fields,
+        rawText,
+        start:   entryStart,
+        end:     i,
+      });
+    }
+    return entries;
+  }
+
+  // ── Paragraph deduplication ───────────────────────────────────────────────
+
+  /**
+   * Scan a file for duplicate \paragraph{...} names.
+   * Keeps the first occurrence as-is; appends " 2", " 3", ... to later ones.
+   * Returns { renamed: [{from, to, line}], content } — content is the updated text.
+   * If dryRun is true, returns the same object but does NOT write to disk.
+   */
+  async dedupParagraphs(filePath, dryRun = false, commitMessage) {
+    const content = await this.readRaw(filePath);
+    // Collect all \paragraph{...} / \paragraph*{...} occurrences with positions
+    const re = /\\paragraph(\*?)\{([^}]+)\}/g;
+    const hits = [];
+    let m;
+    while ((m = re.exec(content)) !== null) {
+      hits.push({ star: m[1], title: m[2], start: m.index, end: m.index + m[0].length });
+    }
+    // Group by title (case-sensitive, as LaTeX is)
+    const seen = {};
+    for (const h of hits) {
+      seen[h.title] = (seen[h.title] || 0) + 1;
+    }
+    // Count occurrences as we walk so we can assign numbers
+    const counter = {};
+    const renamed = [];
+    // Build list of replacements (process in order, apply back-to-front)
+    const replacements = [];
+    for (const h of hits) {
+      counter[h.title] = (counter[h.title] || 0) + 1;
+      if (counter[h.title] === 1) continue; // first occurrence — leave alone
+      const newTitle = `${h.title} ${counter[h.title]}`;
+      const newText  = `\\paragraph${h.star}{${newTitle}}`;
+      replacements.push({ start: h.start, end: h.end, newText, from: h.title, to: newTitle });
+      renamed.push({ from: `\\paragraph${h.star}{${h.title}}`, to: newText });
+    }
+    if (replacements.length === 0) {
+      return { renamed: [], message: 'No duplicate \\paragraph names found.' };
+    }
+    // Apply back-to-front to preserve offsets
+    let updated = content;
+    for (const r of replacements.reverse()) {
+      updated = updated.substring(0, r.start) + r.newText + updated.substring(r.end);
+    }
+    if (!dryRun) {
+      await this.writeRaw(filePath, updated, commitMessage || `Deduplicate \\paragraph names via MCP`);
+    }
+    return { renamed, dryRun, message: `${renamed.length} paragraph(s) renamed.` };
+  }
+
+  async searchBibEntries(filePath, query, field = null) {
+    const content = await this.readRaw(filePath);
+    const entries = this._parseBibEntries(content);
+    const q = query.toLowerCase();
+    return entries.filter(e => {
+      if (field) {
+        const f = (e.fields[field.toLowerCase()] || '').toLowerCase();
+        return f.includes(q);
+      }
+      // Search key + all field values
+      if (e.key.toLowerCase().includes(q)) return true;
+      return Object.values(e.fields).some(v => v.toLowerCase().includes(q));
+    }).map(e => ({ key: e.key, type: e.type, fields: e.fields, rawText: e.rawText }));
+  }
+
+  async getBibEntry(filePath, key) {
+    const content = await this.readRaw(filePath);
+    const entries = this._parseBibEntries(content);
+    const entry   = entries.find(e => e.key.toLowerCase() === key.toLowerCase());
+    if (!entry) throw new Error(`BibTeX entry "${key}" not found in ${filePath}`);
+    return { key: entry.key, type: entry.type, fields: entry.fields, rawText: entry.rawText };
+  }
+
+  async writeBibEntry(filePath, key, newEntryText, commitMessage) {
+    const content = await this.readRaw(filePath);
+    const entries = this._parseBibEntries(content);
+    const entry   = entries.find(e => e.key.toLowerCase() === key.toLowerCase());
+    if (!entry) throw new Error(`BibTeX entry "${key}" not found in ${filePath}`);
+    const updated = content.substring(0, entry.start) + newEntryText.trimEnd() + content.substring(entry.end);
+    return this.writeRaw(filePath, updated, commitMessage || `Update BibTeX entry "${key}" via MCP`);
+  }
+
   async createFile(filePath, content = '', commitMessage = 'Create file via MCP') {
     return this.writeRaw(filePath, content, commitMessage);
+  }
+
+  async copyFile(srcPath, destPath, commitMessage) {
+    const content = await this.readRaw(srcPath);
+    return this.writeRaw(destPath, content, commitMessage || `Copy "${srcPath}" to "${destPath}" via MCP`);
   }
 
   async deleteFile(filePath, commitMessage = 'Delete file via MCP') {
@@ -299,7 +433,7 @@ class OverleafGitClient {
 
 // ── MCP server ───────────────────────────────────────────────────────────────
 const server = new Server(
-  { name: 'overleaf-mcp-server', version: '1.7.0' },
+  { name: 'overleaf-mcp-server', version: '1.10.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -341,7 +475,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           projectName: projectNameProp,
-          extension: { type: 'string', description: 'File extension filter (optional, e.g. ".tex")' },
+              extension: { type: 'string', description: 'File extension filter (optional, e.g. ".tex" or ".bib". Defaults to ".tex")' },
         },
       },
     },
@@ -374,6 +508,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           projectName: projectNameProp,
         },
         required: ['filePath'],
+      },
+    },
+    {
+      name: 'copy_file',
+      description: 'Copy a file within the project without passing content through the agent.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          srcPath:       { type: 'string', description: 'Source file path (relative to project root)' },
+          destPath:      { type: 'string', description: 'Destination file path (relative to project root)' },
+          commitMessage: commitMsgProp,
+          projectName:   projectNameProp,
+        },
+        required: ['srcPath', 'destPath'],
       },
     },
     {
@@ -486,6 +634,66 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
 
+    // ── Paragraph dedup ───────────────────────────────────────────────────────
+    {
+      name: 'dedup_paragraphs',
+      description: 'Scan a .tex file for duplicate \\paragraph{} names and rename them by appending " 2", " 3", etc. First occurrence keeps its name. Use dryRun:true to preview changes without writing.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:      filePathProp,
+          dryRun:        { type: 'boolean', description: 'Preview changes without writing (default: false)' },
+          commitMessage: commitMsgProp,
+          projectName:   projectNameProp,
+        },
+        required: ['filePath'],
+      },
+    },
+
+    // ── BibTeX ───────────────────────────────────────────────────────────────
+    {
+      name: 'search_bib_entries',
+      description: 'Search BibTeX entries in a .bib file by any field value or citation key (case-insensitive, partial match). Optionally scope to a specific field (e.g. "title", "author").',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:    filePathProp,
+          query:       { type: 'string', description: 'Search string (partial match, case-insensitive)' },
+          field:       { type: 'string', description: 'Limit search to this field name, e.g. "title" or "author" (optional)' },
+          projectName: projectNameProp,
+        },
+        required: ['filePath', 'query'],
+      },
+    },
+    {
+      name: 'get_bib_entry',
+      description: 'Retrieve a single BibTeX entry by its citation key.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:    filePathProp,
+          key:         { type: 'string', description: 'Citation key (e.g. "smith2020")' },
+          projectName: projectNameProp,
+        },
+        required: ['filePath', 'key'],
+      },
+    },
+    {
+      name: 'write_bib_entry',
+      description: 'Replace a single BibTeX entry in-place and push to Overleaf. Only the targeted entry is modified. Provide the full replacement entry text including @type{key, ...}.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:     filePathProp,
+          key:          { type: 'string', description: 'Citation key of the entry to replace' },
+          newEntryText: { type: 'string', description: 'Full replacement BibTeX entry text' },
+          commitMessage: commitMsgProp,
+          projectName:  projectNameProp,
+        },
+        required: ['filePath', 'key', 'newEntryText'],
+      },
+    },
+
     // ── Search ────────────────────────────────────────────────────────────
     {
       name: 'search_paragraphs',
@@ -562,6 +770,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: await c.createFile(args.filePath, args.content || '', args.commitMessage || `Create ${args.filePath} via MCP`) }] };
       }
 
+      case 'copy_file': {
+        const c = getProject(args.projectName);
+        return { content: [{ type: 'text', text: await c.copyFile(args.srcPath, args.destPath, args.commitMessage) }] };
+      }
+
       case 'delete_file': {
         const c = getProject(args.projectName);
         return { content: [{ type: 'text', text: await c.deleteFile(args.filePath, args.commitMessage || `Delete ${args.filePath} via MCP`) }] };
@@ -605,6 +818,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'insert_section': {
         const c = getProject(args.projectName);
         return { content: [{ type: 'text', text: await c.insertSection(args.filePath, args.anchorTitle, args.newContent, args.position || 'after', args.anchorType || null, args.commitMessage) }] };
+      }
+
+      case 'dedup_paragraphs': {
+        const c      = getProject(args.projectName);
+        const result = await c.dedupParagraphs(args.filePath, args.dryRun ?? false, args.commitMessage);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'search_bib_entries': {
+        const c       = getProject(args.projectName);
+        const results = await c.searchBibEntries(args.filePath, args.query, args.field || null);
+        return { content: [{ type: 'text', text: `${results.length} entry/entries matched.
+
+` + JSON.stringify(results, null, 2) }] };
+      }
+
+      case 'get_bib_entry': {
+        const c     = getProject(args.projectName);
+        const entry = await c.getBibEntry(args.filePath, args.key);
+        return { content: [{ type: 'text', text: JSON.stringify(entry, null, 2) }] };
+      }
+
+      case 'write_bib_entry': {
+        const c = getProject(args.projectName);
+        return { content: [{ type: 'text', text: await c.writeBibEntry(args.filePath, args.key, args.newEntryText, args.commitMessage) }] };
       }
 
       case 'search_paragraphs': {

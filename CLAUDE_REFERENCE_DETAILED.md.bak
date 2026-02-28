@@ -1,0 +1,127 @@
+# Overleaf MCP — Detailed Reference (v1.8)
+
+> **Day-to-day use:** see `CLAUDE_REFERENCE.md` (cheat sheet).  
+> Load this file only when you need to understand a specific tool, class, or behaviour in depth.
+
+---
+
+## Architecture
+
+```
+overleaf-mcp-server.js   ← MCP tool layer (tool definitions + request handler)
+OverleafGitClient        ← class inside same file: all git + file logic
+projects.json            ← project config: { projects: { default: { projectId, gitToken, name } } }
+```
+
+The server clones/pulls the Overleaf repo via `https://git:<token>@git.overleaf.com/<projectId>` into a temp dir (`/tmp/overleaf-<projectId>`), operates on the local files, then commits and pushes.
+
+---
+
+## OverleafGitClient — method reference
+
+### Low-level I/O
+| Method | Description |
+|---|---|
+| `cloneOrPull()` | Ensures local repo is up-to-date |
+| `readRaw(filePath)` | Read raw file content (pulls first) |
+| `writeRaw(filePath, content, commitMessage)` | Write + commit + push |
+
+### Preamble
+| Method | Notes |
+|---|---|
+| `getPreamble(filePath)` | Returns everything before `\begin{document}` |
+| `writePreamble(filePath, newPreamble, msg)` | Replaces preamble, preserves body exactly. Throws if no `\begin{document}`. |
+
+### Headings / Sections
+| Method | Notes |
+|---|---|
+| `_parseHeadings(content)` | Returns `[{title, type, level, index}]` for all 4 levels |
+| `_headingBounds(content, title, type?)` | Returns `[start, end]` char indices of a heading block |
+| `getSections(filePath, typeFilter?)` | Public; returns heading list |
+| `getSectionContent(filePath, title, type?)` | Returns raw text of block |
+| `writeSection(filePath, title, newContent, type?, msg)` | In-place block replace |
+| `moveSection(filePath, src, anchor, position, type?, msg)` | Atomic cut-and-splice |
+| `insertSection(filePath, anchor, newContent, position, anchorType?, msg)` | Insert before/after |
+
+**Heading levels:**
+```
+section=1  subsection=2  subsubsection=3  paragraph=4
+```
+Block boundary = next heading at same or higher level (lower number).
+
+### BibTeX
+| Method | Notes |
+|---|---|
+| `_parseBibEntries(content)` | Returns `[{key, type, fields, rawText, start, end}]` |
+| `searchBibEntries(filePath, query, field?)` | Case-insensitive partial match; searches all fields or one |
+| `getBibEntry(filePath, key)` | Exact key lookup (case-insensitive) |
+| `writeBibEntry(filePath, key, newEntryText, msg)` | Replaces only that entry's char range |
+
+**BibTeX parser notes:**
+- Handles `field = {value}`, `field = "value"`, `field = number`
+- Nested braces in values are handled by the brace-depth walker
+- `rawText` is the full original entry text including `@type{key, ...}`
+- `start`/`end` are character offsets in the file — used for precise in-place replacement
+
+### Paragraph search
+| Method | Notes |
+|---|---|
+| `_parseParagraphs(slice, baseOffset)` | Splits on blank lines, skips heading lines |
+| `_buildLocationIndex(content)` | Returns a function `(pos, type) → heading title` |
+| `searchParagraphs(filePath, keywords, matchAll, sectionTitle?, type?)` | Returns `[{matchedKeywords, location, text}]` |
+
+`location` object has keys for each heading level that encloses the paragraph, e.g.:
+```json
+{ "section": "Introduction", "subsection": "Background" }
+```
+
+### File management
+| Method | Notes |
+|---|---|
+| `listFiles(extension?)` | Defaults to `.tex`; pass `.bib` etc. |
+| `createFile(filePath, content, msg)` | `mkdir -p` then write |
+| `deleteFile(filePath, msg)` | `git rm` + push |
+
+---
+
+## Tool → method mapping
+
+| MCP Tool | OverleafGitClient method |
+|---|---|
+| `list_files` | `listFiles` |
+| `read_file` | `readFile` (alias for `readRaw`) |
+| `create_file` | `createFile` |
+| `delete_file` | `deleteFile` |
+| `get_preamble` | `getPreamble` |
+| `write_preamble` | `writePreamble` |
+| `get_sections` | `getSections` |
+| `get_section_content` | `getSectionContent` |
+| `write_section` | `writeSection` |
+| `move_section` | `moveSection` |
+| `insert_section` | `insertSection` |
+| `search_bib_entries` | `searchBibEntries` |
+| `get_bib_entry` | `getBibEntry` |
+| `write_bib_entry` | `writeBibEntry` |
+| `search_paragraphs` | `searchParagraphs` |
+| `status_summary` | `listFiles` + `getSections` |
+
+---
+
+## Edge cases & gotchas
+
+- **Starred headings** (`\section*{...}`) are parsed and matched correctly
+- **`write_preamble`** throws if file has no `\begin{document}` — not safe for included files
+- **`move_section`**: source and anchor must be distinct; `sectionType` applies to both
+- **BibTeX `field = {nested {braces}}`**: inner braces are fine — parser walks depth correctly
+- **`search_bib_entries` with no `field`**: searches citation key AND all field values
+- **All writes pull first** — concurrent edits from Overleaf UI will be picked up before each write
+
+---
+
+## Adding a new tool (developer guide)
+
+1. Add a method to `OverleafGitClient`
+2. Add an entry to the `tools` array in `ListToolsRequestSchema` handler
+3. Add a `case` in the `CallToolRequestSchema` switch
+4. Update version string in `new Server(...)` call
+5. Update both `CLAUDE_REFERENCE.md` (cheat sheet table) and this file
