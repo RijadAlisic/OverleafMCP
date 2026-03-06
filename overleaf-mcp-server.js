@@ -6,7 +6,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, appendFile } from 'fs/promises';
 import { promisify } from 'util';
 import { exec as execCallback } from 'child_process';
 import path from 'path';
@@ -408,6 +408,156 @@ class OverleafGitClient {
     return this.writeRaw(filePath, updated, commitMessage || `Update BibTeX entry "${key}" via MCP`);
   }
 
+  // ── Line-level editing helpers ──────────────────────────────────────────
+
+  _diffLines(oldLines, newLines) {
+    const out = [];
+    let i = 0, j = 0;
+    while (i < oldLines.length || j < newLines.length) {
+      if (i < oldLines.length && j < newLines.length && oldLines[i] === newLines[j]) {
+        out.push(` ${oldLines[i]}`); i++; j++;
+      } else {
+        // drain old
+        while (i < oldLines.length && (j >= newLines.length || oldLines[i] !== newLines[j])) {
+          out.push(`-${oldLines[i]}`); i++;
+        }
+        // drain new
+        while (j < newLines.length && (i >= oldLines.length || oldLines[i] !== newLines[j])) {
+          out.push(`+${newLines[j]}`); j++;
+        }
+      }
+    }
+    return out.join('\n');
+  }
+
+  async editFile(filePath, edits, dryRun = false, commitMessage) {
+    await this.cloneOrPull();
+    let content = await readFile(path.join(this.repoPath, filePath), 'utf-8');
+    const original = content;
+    const applied = [];
+    for (const edit of edits) {
+      if (!content.includes(edit.oldText))
+        throw new Error(`edit_file: oldText not found in ${filePath}: ${JSON.stringify(edit.oldText.slice(0, 60))}...`);
+      content = content.replace(edit.oldText, edit.newText);
+      applied.push(edit);
+    }
+    const oldLines = original.split('\n');
+    const newLines = content.split('\n');
+    const diff = this._diffLines(oldLines, newLines);
+    if (!dryRun) {
+      await writeFile(path.join(this.repoPath, filePath), content, 'utf-8');
+      await this.commitAndPush(filePath, commitMessage || `Edit ${filePath} via MCP (${applied.length} edit(s))`);
+    }
+    return diff;
+  }
+
+  async readLines(filePath, start, end) {
+    await this.cloneOrPull();
+    const content = await readFile(path.join(this.repoPath, filePath), 'utf-8');
+    const lines = content.split('\n');
+    const total = lines.length;
+    const from = Math.max(1, start);
+    const to   = end !== undefined ? Math.min(end, total) : total;
+    return { lines: lines.slice(from - 1, to), from, to, total };
+  }
+
+  async findInFile(filePath, searchText, { caseSensitive = false, context = 0 } = {}) {
+    await this.cloneOrPull();
+    const content = await readFile(path.join(this.repoPath, filePath), 'utf-8');
+    const lines = content.split('\n');
+    const needle = caseSensitive ? searchText : searchText.toLowerCase();
+    const results = [];
+    lines.forEach((line, idx) => {
+      const hay = caseSensitive ? line : line.toLowerCase();
+      if (!hay.includes(needle)) return;
+      const matchLine = idx + 1;
+      if (context === 0) {
+        results.push({ line: matchLine, text: line });
+      } else {
+        const ctxStart = Math.max(0, idx - context);
+        const ctxEnd   = Math.min(lines.length - 1, idx + context);
+        const contextLines = [];
+        for (let c = ctxStart; c <= ctxEnd; c++) {
+          contextLines.push({ line: c + 1, text: lines[c], isMatch: c === idx });
+        }
+        results.push({ matchLine, contextLines });
+      }
+    });
+    return results;
+  }
+
+  async replaceLines(filePath, start, end, newContent, commitMessage) {
+    await this.cloneOrPull();
+    const fullPath = path.join(this.repoPath, filePath);
+    const content = await readFile(fullPath, 'utf-8');
+    const lines = content.split('\n');
+    const total = lines.length;
+    const from = Math.max(1, start) - 1;
+    const to   = Math.min(end, total);
+    const replacedLines = to - from;
+    const newLines = newContent.split('\n');
+    lines.splice(from, replacedLines, ...newLines);
+    await writeFile(fullPath, lines.join('\n'), 'utf-8');
+    await this.commitAndPush(filePath, commitMessage || `Replace lines ${start}-${end} in ${filePath} via MCP`);
+    return { replacedLines, newLines: newLines.length, total: lines.length };
+  }
+
+  async insertLines(filePath, afterLine, content, commitMessage) {
+    await this.cloneOrPull();
+    const fullPath = path.join(this.repoPath, filePath);
+    const existing = await readFile(fullPath, 'utf-8');
+    const lines = existing.split('\n');
+    const newLines = content.split('\n');
+    lines.splice(afterLine, 0, ...newLines);
+    await writeFile(fullPath, lines.join('\n'), 'utf-8');
+    await this.commitAndPush(filePath, commitMessage || `Insert lines after ${afterLine} in ${filePath} via MCP`);
+    return { insertedLines: newLines.length, total: lines.length };
+  }
+
+  async deleteLines(filePath, start, end, commitMessage) {
+    await this.cloneOrPull();
+    const fullPath = path.join(this.repoPath, filePath);
+    const content = await readFile(fullPath, 'utf-8');
+    const lines = content.split('\n');
+    const from = Math.max(1, start) - 1;
+    const to   = Math.min(end, lines.length);
+    const deletedLines = to - from;
+    lines.splice(from, deletedLines);
+    await writeFile(fullPath, lines.join('\n'), 'utf-8');
+    await this.commitAndPush(filePath, commitMessage || `Delete lines ${start}-${end} in ${filePath} via MCP`);
+    return { deletedLines, total: lines.length };
+  }
+
+  async appendToFile(filePath, content, commitMessage) {
+    await this.cloneOrPull();
+    const fullPath = path.join(this.repoPath, filePath);
+    await appendFile(fullPath, content, 'utf-8');
+    await this.commitAndPush(filePath, commitMessage || `Append to ${filePath} via MCP`);
+  }
+
+  async findInFiles(dirPath, searchText, { caseSensitive = false, filePattern = null, excludePatterns = [] } = {}) {
+    await this.cloneOrPull();
+    const absDir = dirPath ? path.join(this.repoPath, dirPath) : this.repoPath;
+    const grepFlags = caseSensitive ? '-rn' : '-rni';
+    const includeFlag = filePattern ? `--include='${filePattern}'` : '';
+    const excludeFlags = excludePatterns.map(p => `--exclude-dir='${p}'`).join(' ');
+    const needle = searchText.replace(/'/g, "'\\''" );
+    try {
+      const { stdout } = await exec(
+        `grep ${grepFlags} ${includeFlag} ${excludeFlags} '${needle}' '${absDir}' --exclude-dir=.git`,
+        { env: process.env }
+      );
+      return stdout.trim().split('\n').filter(Boolean).map(line => {
+        const m = line.match(/^(.+?):(\d+):(.*)$/);
+        if (!m) return null;
+        return { file: m[1].replace(this.repoPath + '/', ''), line: parseInt(m[2], 10), text: m[3] };
+      }).filter(Boolean);
+    } catch (e) {
+      if (e.code === 1) return []; // grep exit 1 = no matches
+      throw e;
+    }
+  }
+
   async createFile(filePath, content = '', commitMessage = 'Create file via MCP') {
     return this.writeRaw(filePath, content, commitMessage);
   }
@@ -694,6 +844,139 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
 
+    // ── Line-level editing ─────────────────────────────────────────────────
+    {
+      name: 'edit_file',
+      description: 'Make targeted text edits to a file. Each edit replaces an exact string with new content. Returns a git-style diff. Use dryRun:true to preview without writing. More precise than write_section for small changes.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:      filePathProp,
+          edits: {
+            type: 'array',
+            description: 'List of text replacements to apply in order',
+            items: {
+              type: 'object',
+              properties: {
+                oldText: { type: 'string', description: 'Exact text to search for — must match precisely' },
+                newText: { type: 'string', description: 'Text to replace it with' },
+              },
+              required: ['oldText', 'newText'],
+            },
+          },
+          dryRun:        { type: 'boolean', description: 'Preview diff without writing (default: false)' },
+          commitMessage: commitMsgProp,
+          projectName:   projectNameProp,
+        },
+        required: ['filePath', 'edits'],
+      },
+    },
+    {
+      name: 'read_lines',
+      description: 'Read a specific range of lines from a file by line number, with line numbers shown. Use find_in_file first to locate the relevant line numbers.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:    filePathProp,
+          start:       { type: 'integer', minimum: 1, description: 'First line to read (1-indexed)' },
+          end:         { type: 'integer', description: 'Last line to read (inclusive). Omit to read to end of file.' },
+          projectName: projectNameProp,
+        },
+        required: ['filePath', 'start'],
+      },
+    },
+    {
+      name: 'find_in_file',
+      description: 'Search for a keyword or phrase within a single file, returning matching line numbers and text. Optionally include surrounding context lines. Use before read_lines or edit_file to locate exactly where something is.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:      filePathProp,
+          text:          { type: 'string', description: 'Text to search for' },
+          caseSensitive: { type: 'boolean', description: 'Case-sensitive search (default: false)' },
+          context:       { type: 'integer', minimum: 0, description: 'Lines of context above and below each match (default: 0)' },
+          projectName:   projectNameProp,
+        },
+        required: ['filePath', 'text'],
+      },
+    },
+    {
+      name: 'replace_lines',
+      description: 'Replace a range of lines in a file by line number and push. More efficient than edit_file when you already know the exact line numbers from find_in_file.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:      filePathProp,
+          start:         { type: 'integer', minimum: 1, description: 'First line to replace (1-indexed)' },
+          end:           { type: 'integer', description: 'Last line to replace (inclusive)' },
+          content:       { type: 'string', description: 'New content to replace the line range with' },
+          commitMessage: commitMsgProp,
+          projectName:   projectNameProp,
+        },
+        required: ['filePath', 'start', 'end', 'content'],
+      },
+    },
+    {
+      name: 'insert_lines',
+      description: 'Insert new content after a specific line number and push. Use line 0 to insert at the beginning of the file.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:      filePathProp,
+          after_line:    { type: 'integer', minimum: 0, description: 'Insert after this line number. Use 0 to insert at the beginning.' },
+          content:       { type: 'string', description: 'Content to insert' },
+          commitMessage: commitMsgProp,
+          projectName:   projectNameProp,
+        },
+        required: ['filePath', 'after_line', 'content'],
+      },
+    },
+    {
+      name: 'delete_lines',
+      description: 'Delete a range of lines from a file by line number and push.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:      filePathProp,
+          start:         { type: 'integer', minimum: 1, description: 'First line to delete (1-indexed)' },
+          end:           { type: 'integer', description: 'Last line to delete (inclusive)' },
+          commitMessage: commitMsgProp,
+          projectName:   projectNameProp,
+        },
+        required: ['filePath', 'start', 'end'],
+      },
+    },
+    {
+      name: 'append_to_file',
+      description: 'Append content to the end of a file and push. More efficient than write_section when you just need to add to the end.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:      filePathProp,
+          content:       { type: 'string', description: 'Content to append' },
+          commitMessage: commitMsgProp,
+          projectName:   projectNameProp,
+        },
+        required: ['filePath', 'content'],
+      },
+    },
+    {
+      name: 'find_in_files',
+      description: 'Search for a text string recursively across all files in the project. Returns each matching file path, line number, and matching line. Optionally filter by glob pattern or exclude paths.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          dirPath:         { type: 'string', description: 'Subdirectory to search in (relative to project root). Omit to search entire project.' },
+          text:            { type: 'string', description: 'Text to search for' },
+          filePattern:     { type: 'string', description: "Glob pattern to filter files, e.g. '*.tex'" },
+          caseSensitive:   { type: 'boolean', description: 'Case-sensitive search (default: false)' },
+          excludePatterns: { type: 'array', items: { type: 'string' }, description: 'Directory names to exclude' },
+          projectName:     projectNameProp,
+        },
+        required: ['text'],
+      },
+    },
+
     // ── Search ────────────────────────────────────────────────────────────
     {
       name: 'search_paragraphs',
@@ -849,6 +1132,76 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const c       = getProject(args.projectName);
         const results = await c.searchParagraphs(args.filePath, args.keywords, args.matchAll ?? false, args.sectionTitle || null, args.sectionType || null);
         return { content: [{ type: 'text', text: `${results.length} paragraph(s) matched.\n\n` + JSON.stringify(results, null, 2) }] };
+      }
+
+      case 'edit_file': {
+        const c    = getProject(args.projectName);
+        const diff = await c.editFile(args.filePath, args.edits, args.dryRun ?? false, args.commitMessage);
+        return { content: [{ type: 'text', text: diff }] };
+      }
+
+      case 'read_lines': {
+        const c = getProject(args.projectName);
+        const { lines, from, to, total } = await c.readLines(args.filePath, args.start, args.end);
+        const numbered = lines.map((line, i) => `${from + i}: ${line}`).join('\n');
+        return { content: [{ type: 'text', text: `Lines ${from}-${to} of ${total}:\n${numbered}` }] };
+      }
+
+      case 'find_in_file': {
+        const c       = getProject(args.projectName);
+        const results = await c.findInFile(args.filePath, args.text, {
+          caseSensitive: args.caseSensitive ?? false,
+          context:       args.context ?? 0,
+        });
+        let text;
+        if (results.length === 0) {
+          text = 'No matches found';
+        } else if ((args.context ?? 0) > 0) {
+          text = results.map(r => {
+            const lines = r.contextLines.map(l => `${l.isMatch ? '>' : ' '} ${l.line}: ${l.text}`).join('\n');
+            return `Match at line ${r.matchLine}:\n${lines}`;
+          }).join('\n\n');
+        } else {
+          text = results.map(r => `${r.line}: ${r.text}`).join('\n');
+        }
+        return { content: [{ type: 'text', text }] };
+      }
+
+      case 'replace_lines': {
+        const c      = getProject(args.projectName);
+        const result = await c.replaceLines(args.filePath, args.start, args.end, args.content, args.commitMessage);
+        return { content: [{ type: 'text', text: `Replaced ${result.replacedLines} lines with ${result.newLines} lines. File now has ${result.total} lines.` }] };
+      }
+
+      case 'insert_lines': {
+        const c      = getProject(args.projectName);
+        const result = await c.insertLines(args.filePath, args.after_line, args.content, args.commitMessage);
+        return { content: [{ type: 'text', text: `Inserted ${result.insertedLines} lines after line ${args.after_line}. File now has ${result.total} lines.` }] };
+      }
+
+      case 'delete_lines': {
+        const c      = getProject(args.projectName);
+        const result = await c.deleteLines(args.filePath, args.start, args.end, args.commitMessage);
+        return { content: [{ type: 'text', text: `Deleted ${result.deletedLines} lines. File now has ${result.total} lines.` }] };
+      }
+
+      case 'append_to_file': {
+        const c = getProject(args.projectName);
+        await c.appendToFile(args.filePath, args.content, args.commitMessage);
+        return { content: [{ type: 'text', text: `Successfully appended to ${args.filePath}` }] };
+      }
+
+      case 'find_in_files': {
+        const c       = getProject(args.projectName);
+        const results = await c.findInFiles(args.dirPath || '', args.text, {
+          caseSensitive:   args.caseSensitive ?? false,
+          filePattern:     args.filePattern || null,
+          excludePatterns: args.excludePatterns || [],
+        });
+        const text = results.length > 0
+          ? results.map(r => `${r.file}:${r.line}: ${r.text}`).join('\n')
+          : 'No matches found';
+        return { content: [{ type: 'text', text }] };
       }
 
       default:
