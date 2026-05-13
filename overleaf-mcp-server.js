@@ -432,21 +432,23 @@ class OverleafGitClient {
 
   async editFile(filePath, edits, dryRun = false, commitMessage) {
     await this.cloneOrPull();
-    let content = await readFile(path.join(this.repoPath, filePath), 'utf-8');
-    const original = content;
-    const applied = [];
-    for (const edit of edits) {
-      if (!content.includes(edit.oldText))
-        throw new Error(`edit_file: oldText not found in ${filePath}: ${JSON.stringify(edit.oldText.slice(0, 60))}...`);
-      content = content.replace(edit.oldText, edit.newText);
-      applied.push(edit);
+    const content = await readFile(path.join(this.repoPath, filePath), 'utf-8');
+    const lines = content.split('\n');
+    const total = lines.length;
+    // Apply in reverse order so earlier line numbers stay valid after each splice
+    const sorted = [...edits].sort((a, b) => b.startLine - a.startLine);
+    for (const edit of sorted) {
+      const start       = Math.max(1, edit.startLine) - 1;  // convert to 0-indexed
+      const end         = edit.endLine !== undefined ? Math.min(total, edit.endLine) : edit.startLine;
+      const deleteCount = end - start;                       // number of lines to remove
+      const replacement = edit.newText ? edit.newText.split('\n') : [];
+      lines.splice(start, deleteCount, ...replacement);
     }
-    const oldLines = original.split('\n');
-    const newLines = content.split('\n');
-    const diff = this._diffLines(oldLines, newLines);
+    const newContent = lines.join('\n');
+    const diff = this._diffLines(content.split('\n'), newContent.split('\n'));
     if (!dryRun) {
-      await writeFile(path.join(this.repoPath, filePath), content, 'utf-8');
-      await this.commitAndPush(filePath, commitMessage || `Edit ${filePath} via MCP (${applied.length} edit(s))`);
+      await writeFile(path.join(this.repoPath, filePath), newContent, 'utf-8');
+      await this.commitAndPush(filePath, commitMessage || `Edit ${filePath} via MCP (${edits.length} edit(s))`);
     }
     return diff;
   }
@@ -847,21 +849,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     // ── Line-level editing ─────────────────────────────────────────────────
     {
       name: 'edit_file',
-      description: 'Make targeted text edits to a file. Each edit replaces an exact string with new content. Returns a git-style diff. Use dryRun:true to preview without writing. More precise than write_section for small changes.',
+      description: 'Make targeted line-based edits to a file. Each edit replaces a line range with new content (which may span any number of lines). Edits are applied in reverse line order so indices stay stable. Returns a git-style diff. Use dryRun:true to preview without writing.',
       inputSchema: {
         type: 'object',
         properties: {
           filePath:      filePathProp,
           edits: {
             type: 'array',
-            description: 'List of text replacements to apply in order',
+            description: 'List of line-range replacements — applied in reverse order so earlier line numbers stay valid',
             items: {
               type: 'object',
               properties: {
-                oldText: { type: 'string', description: 'Exact text to search for — must match precisely' },
-                newText: { type: 'string', description: 'Text to replace it with' },
+                startLine: { type: 'integer', minimum: 1, description: 'First line to replace (1-indexed, inclusive)' },
+                endLine:   { type: 'integer', description: 'Last line to replace (1-indexed, inclusive). Defaults to startLine for single-line replacement.' },
+                newText:   { type: 'string',  description: 'Replacement text. Can be multiline. Omit or use empty string to delete the lines.' },
               },
-              required: ['oldText', 'newText'],
+              required: ['startLine'],
             },
           },
           dryRun:        { type: 'boolean', description: 'Preview diff without writing (default: false)' },
