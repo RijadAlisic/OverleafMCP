@@ -126,12 +126,19 @@ class OverleafGitClient {
     const regex    = /\\(section|subsection|subsubsection|paragraph)\*?\{([^}]+)\}/g;
     let m;
     while ((m = regex.exec(content)) !== null) {
+      const startLine = content.substring(0, m.index).split('\n').length;
       headings.push({
         title: m[2],
         type:  m[1],
         level: SECTION_LEVELS[m[1]],
-        index: m.index,
+        startLine,
       });
+    }
+    // Annotate endLine = line before next same-or-higher heading (or end of file)
+    const totalLines = content.split('\n').length;
+    for (let i = 0; i < headings.length; i++) {
+      const next = headings.slice(i + 1).find(h => h.level <= headings[i].level);
+      headings[i].endLine = next ? next.startLine - 1 : totalLines;
     }
     return headings;
   }
@@ -376,7 +383,7 @@ class OverleafGitClient {
     return { renamed, dryRun, message: `${renamed.length} paragraph(s) renamed.` };
   }
 
-  async searchBibEntries(filePath, query, field = null) {
+  async searchBibEntries(filePath, query, field = null, includeRaw = false) {
     const content = await this.readRaw(filePath);
     const entries = this._parseBibEntries(content);
     const q = query.toLowerCase();
@@ -385,10 +392,13 @@ class OverleafGitClient {
         const f = (e.fields[field.toLowerCase()] || '').toLowerCase();
         return f.includes(q);
       }
-      // Search key + all field values
       if (e.key.toLowerCase().includes(q)) return true;
       return Object.values(e.fields).some(v => v.toLowerCase().includes(q));
-    }).map(e => ({ key: e.key, type: e.type, fields: e.fields, rawText: e.rawText }));
+    }).map(e => {
+      const out = { key: e.key, type: e.type, fields: e.fields };
+      if (includeRaw) out.rawText = e.rawText;
+      return out;
+    });
   }
 
   async getBibEntry(filePath, key) {
@@ -406,6 +416,29 @@ class OverleafGitClient {
     if (!entry) throw new Error(`BibTeX entry "${key}" not found in ${filePath}`);
     const updated = content.substring(0, entry.start) + newEntryText.trimEnd() + content.substring(entry.end);
     return this.writeRaw(filePath, updated, commitMessage || `Update BibTeX entry "${key}" via MCP`);
+  }
+
+
+  async updateBibField(filePath, key, field, value, commitMessage) {
+    const content = await this.readRaw(filePath);
+    const entries = this._parseBibEntries(content);
+    const entry   = entries.find(e => e.key.toLowerCase() === key.toLowerCase());
+    if (!entry) throw new Error(`BibTeX entry "${key}" not found in ${filePath}`);
+    const fname   = field.toLowerCase();
+    const fieldRe = new RegExp(
+      `(\\b${fname}\\s*=\\s*)(?:\\{[^}]*\\}|"[^"]*"|[\\w\\d]+)`,
+      'i'
+    );
+    let newRaw;
+    if (fieldRe.test(entry.rawText)) {
+      // Replace existing field value
+      newRaw = entry.rawText.replace(fieldRe, `$1{${value}}`);
+    } else {
+      // Field doesn't exist — insert before the closing brace
+      newRaw = entry.rawText.replace(/(\n?)\}(\s*)$/, `$1  ${fname} = {${value}},\n}$2`);
+    }
+    const updated = content.substring(0, entry.start) + newRaw + content.substring(entry.end);
+    return this.writeRaw(filePath, updated, commitMessage || `Update "${key}.${field}" via MCP`);
   }
 
   // ── Line-level editing helpers ──────────────────────────────────────────
@@ -466,26 +499,18 @@ class OverleafGitClient {
   async findInFile(filePath, searchText, { caseSensitive = false, context = 0 } = {}) {
     await this.cloneOrPull();
     const content = await readFile(path.join(this.repoPath, filePath), 'utf-8');
-    const lines = content.split('\n');
-    const needle = caseSensitive ? searchText : searchText.toLowerCase();
-    const results = [];
-    lines.forEach((line, idx) => {
-      const hay = caseSensitive ? line : line.toLowerCase();
-      if (!hay.includes(needle)) return;
-      const matchLine = idx + 1;
-      if (context === 0) {
-        results.push({ line: matchLine, text: line });
-      } else {
-        const ctxStart = Math.max(0, idx - context);
-        const ctxEnd   = Math.min(lines.length - 1, idx + context);
-        const contextLines = [];
-        for (let c = ctxStart; c <= ctxEnd; c++) {
-          contextLines.push({ line: c + 1, text: lines[c], isMatch: c === idx });
-        }
-        results.push({ matchLine, contextLines });
+    const lines   = content.split('\n');
+    const matches = _multilineSearch(lines, searchText, caseSensitive);
+    if (context === 0) return matches;
+    return matches.map(m => {
+      const ctxStart = Math.max(0, m.startLine - 1 - context);
+      const ctxEnd   = Math.min(lines.length - 1, m.endLine - 1 + context);
+      const contextLines = [];
+      for (let c = ctxStart; c <= ctxEnd; c++) {
+        contextLines.push({ line: c + 1, text: lines[c], isMatch: c >= m.startLine - 1 && c <= m.endLine - 1 });
       }
+      return { ...m, contextLines };
     });
-    return results;
   }
 
   async replaceLines(filePath, start, end, newContent, commitMessage) {
@@ -540,24 +565,32 @@ class OverleafGitClient {
   async findInFiles(dirPath, searchText, { caseSensitive = false, filePattern = null, excludePatterns = [] } = {}) {
     await this.cloneOrPull();
     const absDir = dirPath ? path.join(this.repoPath, dirPath) : this.repoPath;
-    const grepFlags = caseSensitive ? '-rn' : '-rni';
-    const includeFlag = filePattern ? `--include='${filePattern}'` : '';
-    const excludeFlags = excludePatterns.map(p => `--exclude-dir='${p}'`).join(' ');
-    const needle = searchText.replace(/'/g, "'\\''" );
-    try {
-      const { stdout } = await exec(
-        `grep ${grepFlags} ${includeFlag} ${excludeFlags} '${needle}' '${absDir}' --exclude-dir=.git`,
-        { env: process.env }
-      );
-      return stdout.trim().split('\n').filter(Boolean).map(line => {
-        const m = line.match(/^(.+?):(\d+):(.*)$/);
-        if (!m) return null;
-        return { file: m[1].replace(this.repoPath + '/', ''), line: parseInt(m[2], 10), text: m[3] };
-      }).filter(Boolean);
-    } catch (e) {
-      if (e.code === 1) return []; // grep exit 1 = no matches
-      throw e;
-    }
+    const results = [];
+    const extRe   = filePattern ? new RegExp(filePattern.replace('*', '.*').replace('.', '\\.') + '$') : null;
+    const walk    = async (dir) => {
+      let entries;
+      try { entries = await (await import('fs/promises')).readdir(dir, { withFileTypes: true }); }
+      catch { return; }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === '.git' || excludePatterns.includes(entry.name)) continue;
+          await walk(full);
+        } else {
+          if (extRe && !extRe.test(entry.name)) continue;
+          let content;
+          try { content = await readFile(full, 'utf-8'); } catch { continue; }
+          const relFile = full.replace(this.repoPath + '/', '');
+          const lines   = content.split('\n');
+          const matches = _multilineSearch(lines, searchText, caseSensitive);
+          for (const m of matches) {
+            results.push({ file: relFile, startLine: m.startLine, endLine: m.endLine, matchText: m.matchText });
+          }
+        }
+      }
+    };
+    await walk(absDir);
+    return results;
   }
 
   async createFile(filePath, content = '', commitMessage = 'Create file via MCP') {
@@ -582,6 +615,58 @@ class OverleafGitClient {
     return `"${filePath}" deleted and pushed.\n${stdout}`;
   }
 }
+
+
+// ── Multi-line search helper ─────────────────────────────────────────────────
+// Matches searchText against file lines with whitespace-normalized matching so
+// phrases split across two lines (e.g. at 80-char wrap) are still found.
+// Returns [{ startLine, endLine, matchText }] (1-indexed, inclusive).
+function _multilineSearch(lines, searchText, caseSensitive = false) {
+  const norm = s => (caseSensitive ? s : s.toLowerCase()).replace(/\s+/g, ' ');
+  const needle = norm(searchText).trim();
+  if (!needle) return [];
+
+  // Build a flat string (newlines → space) and a parallel array mapping each
+  // character in the flat string back to its 1-indexed source line number.
+  const lineOf  = [];
+  const flatArr = [];
+  for (let li = 0; li < lines.length; li++) {
+    for (const ch of lines[li]) { lineOf.push(li + 1); flatArr.push(ch); }
+    if (li < lines.length - 1) { lineOf.push(li + 1); flatArr.push('\n'); }
+  }
+
+  // Build a whitespace-normalised version of the flat string, tracking which
+  // original flat-index each normalised character came from.
+  const normToOrig = [];
+  let normFlat     = '';
+  let prevSpace    = true; // treat start as after-space so leading space is trimmed
+  for (let i = 0; i < flatArr.length; i++) {
+    const isWS = /\s/.test(flatArr[i]);
+    if (isWS) {
+      if (!prevSpace) { normToOrig.push(i); normFlat += ' '; }
+      prevSpace = true;
+    } else {
+      normToOrig.push(i);
+      normFlat += caseSensitive ? flatArr[i] : flatArr[i].toLowerCase();
+      prevSpace = false;
+    }
+  }
+
+  const results = [];
+  let pos = 0;
+  while (pos < normFlat.length) {
+    const idx = normFlat.indexOf(needle, pos);
+    if (idx === -1) break;
+    const origStart = normToOrig[idx];
+    const origEnd   = normToOrig[Math.min(idx + needle.length - 1, normToOrig.length - 1)];
+    const startLine = lineOf[origStart];
+    const endLine   = lineOf[origEnd];
+    results.push({ startLine, endLine, matchText: lines.slice(startLine - 1, endLine).join('\n') });
+    pos = idx + 1;
+  }
+  return results;
+}
+
 
 // ── MCP server ───────────────────────────────────────────────────────────────
 const server = new Server(
@@ -805,13 +890,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     // ── BibTeX ───────────────────────────────────────────────────────────────
     {
       name: 'search_bib_entries',
-      description: 'Search BibTeX entries in a .bib file by any field value or citation key (case-insensitive, partial match). Optionally scope to a specific field (e.g. "title", "author").',
+      description: 'Search BibTeX entries in a .bib file by any field value or citation key (case-insensitive, partial match). Optionally scope to a specific field (e.g. "title", "author"). By default returns structured fields only; set includeRaw:true to also get the full raw BibTeX text.',
       inputSchema: {
         type: 'object',
         properties: {
           filePath:    filePathProp,
           query:       { type: 'string', description: 'Search string (partial match, case-insensitive)' },
           field:       { type: 'string', description: 'Limit search to this field name, e.g. "title" or "author" (optional)' },
+          includeRaw:  { type: 'boolean', description: 'Include full rawText in results (default: false)' },
           projectName: projectNameProp,
         },
         required: ['filePath', 'query'],
@@ -845,6 +931,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['filePath', 'key', 'newEntryText'],
       },
     },
+    {
+      name: 'update_bib_field',
+      description: 'Update or add a single field in a BibTeX entry without touching anything else. Prefer this over write_bib_entry for simple field changes (year, doi, url, etc.).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:     filePathProp,
+          key:          { type: 'string', description: 'Citation key of the entry to update' },
+          field:        { type: 'string', description: 'Field name to set, e.g. "year", "doi", "url"' },
+          value:        { type: 'string', description: 'New value for the field (without surrounding braces)' },
+          commitMessage: commitMsgProp,
+          projectName:  projectNameProp,
+        },
+        required: ['filePath', 'key', 'field', 'value'],
+      },
+    },
+
 
     // ── Line-level editing ─────────────────────────────────────────────────
     {
@@ -890,12 +993,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'find_in_file',
-      description: 'Search for a keyword or phrase within a single file, returning matching line numbers and text. Optionally include surrounding context lines. Use before read_lines or edit_file to locate exactly where something is.',
+      description: 'Search for a phrase within a single file. Handles phrases split across lines (e.g. at 80-char wrap) by matching with whitespace normalization. Returns startLine, endLine, and matchText for each hit. Use context for surrounding lines. Use before read_lines or edit_file to locate exactly where something is.',
       inputSchema: {
         type: 'object',
         properties: {
           filePath:      filePathProp,
-          text:          { type: 'string', description: 'Text to search for' },
+          text:          { type: 'string', description: 'Text to search for. Whitespace (including newlines) is normalized, so multi-word phrases find matches even if split across lines.' },
           caseSensitive: { type: 'boolean', description: 'Case-sensitive search (default: false)' },
           context:       { type: 'integer', minimum: 0, description: 'Lines of context above and below each match (default: 0)' },
           projectName:   projectNameProp,
@@ -1114,10 +1217,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'search_bib_entries': {
         const c       = getProject(args.projectName);
-        const results = await c.searchBibEntries(args.filePath, args.query, args.field || null);
-        return { content: [{ type: 'text', text: `${results.length} entry/entries matched.
-
-` + JSON.stringify(results, null, 2) }] };
+        const results = await c.searchBibEntries(args.filePath, args.query, args.field || null, args.includeRaw ?? false);
+        return { content: [{ type: 'text', text: `${results.length} entry/entries matched.\n\n` + JSON.stringify(results, null, 2) }] };
       }
 
       case 'get_bib_entry': {
@@ -1129,6 +1230,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'write_bib_entry': {
         const c = getProject(args.projectName);
         return { content: [{ type: 'text', text: await c.writeBibEntry(args.filePath, args.key, args.newEntryText, args.commitMessage) }] };
+      }
+
+      case 'update_bib_field': {
+        const c = getProject(args.projectName);
+        return { content: [{ type: 'text', text: await c.updateBibField(args.filePath, args.key, args.field, args.value, args.commitMessage) }] };
       }
 
       case 'search_paragraphs': {
@@ -1161,11 +1267,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           text = 'No matches found';
         } else if ((args.context ?? 0) > 0) {
           text = results.map(r => {
-            const lines = r.contextLines.map(l => `${l.isMatch ? '>' : ' '} ${l.line}: ${l.text}`).join('\n');
-            return `Match at line ${r.matchLine}:\n${lines}`;
+            const ctxLines = r.contextLines.map(l => `${l.isMatch ? '>' : ' '} ${l.line}: ${l.text}`).join('\n');
+            const range = r.startLine === r.endLine ? `line ${r.startLine}` : `lines ${r.startLine}-${r.endLine}`;
+            return `Match at ${range}:\n${ctxLines}`;
           }).join('\n\n');
         } else {
-          text = results.map(r => `${r.line}: ${r.text}`).join('\n');
+          text = results.map(r => {
+            const range = r.startLine === r.endLine ? `${r.startLine}` : `${r.startLine}-${r.endLine}`;
+            return `${range}: ${r.matchText}`;
+          }).join('\n');
         }
         return { content: [{ type: 'text', text }] };
       }
@@ -1202,7 +1312,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           excludePatterns: args.excludePatterns || [],
         });
         const text = results.length > 0
-          ? results.map(r => `${r.file}:${r.line}: ${r.text}`).join('\n')
+          ? results.map(r => {
+              const range = r.startLine === r.endLine ? `${r.startLine}` : `${r.startLine}-${r.endLine}`;
+              return `${r.file}:${range}: ${r.matchText}`;
+            }).join('\n')
           : 'No matches found';
         return { content: [{ type: 'text', text }] };
       }
