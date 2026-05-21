@@ -63,15 +63,31 @@ class OverleafGitClient {
   }
 
   async commitAndPush(filePath, commitMessage) {
+    // git add + commit — tolerate "nothing to commit" (exit 1) which happens
+    // when file content is identical to the last commit (e.g. re-create or
+    // create_file called twice). The file is already on disk; we still push.
+    try {
+      await exec(
+        `cd "${this.repoPath}" && git add "${filePath}" && git commit -m "${commitMessage.replace(/"/g, '\\"')}"`,
+        { env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }
+      );
+    } catch (err) {
+      // git commit exits 1 with "nothing to commit" — not a real error
+      const msg = (err.stdout || '') + (err.stderr || '');
+      if (!msg.includes('nothing to commit') && !msg.includes('nothing added to commit')) {
+        throw err;
+      }
+      // Nothing new to commit — file already matches repo. Continue to push.
+    }
+    // Pull with rebase before pushing to handle remote changes made directly in Overleaf
     await exec(
-      `cd "${this.repoPath}" && git add "${filePath}" && git commit -m "${commitMessage.replace(/"/g, '\\"')}"`,
+      `cd "${this.repoPath}" && git pull --rebase "${this.gitUrlWithAuth}"`,
       { env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }
     );
-    const { stdout } = await exec(
+    await exec(
       `cd "${this.repoPath}" && git push "${this.gitUrlWithAuth}"`,
       { env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }
     );
-    return stdout;
   }
 
   // ── Low-level file I/O ─────────────────────────────────────────────────────
@@ -85,8 +101,8 @@ class OverleafGitClient {
     const fullPath = path.join(this.repoPath, filePath);
     await mkdir(path.dirname(fullPath), { recursive: true });
     await writeFile(fullPath, content, 'utf-8');
-    const pushed = await this.commitAndPush(filePath, commitMessage);
-    return `"${filePath}" written and pushed.\n${pushed}`;
+    await this.commitAndPush(filePath, commitMessage);
+    return `"${filePath}" written and pushed.`;
   }
 
   // ── Preamble helpers ───────────────────────────────────────────────────────
@@ -131,6 +147,7 @@ class OverleafGitClient {
         title: m[2],
         type:  m[1],
         level: SECTION_LEVELS[m[1]],
+        index: m.index,
         startLine,
       });
     }
@@ -443,27 +460,74 @@ class OverleafGitClient {
 
   // ── Line-level editing helpers ──────────────────────────────────────────
 
-  _diffLines(oldLines, newLines) {
-    const out = [];
-    let i = 0, j = 0;
-    while (i < oldLines.length || j < newLines.length) {
-      if (i < oldLines.length && j < newLines.length && oldLines[i] === newLines[j]) {
-        out.push(` ${oldLines[i]}`); i++; j++;
-      } else {
-        // drain old
-        while (i < oldLines.length && (j >= newLines.length || oldLines[i] !== newLines[j])) {
-          out.push(`-${oldLines[i]}`); i++;
-        }
-        // drain new
-        while (j < newLines.length && (i >= oldLines.length || oldLines[i] !== newLines[j])) {
-          out.push(`+${newLines[j]}`); j++;
+  _diffLines(oldLines, newLines, context = 1) {
+    // unchanged lines are context (prefixed with space).
+    const m = oldLines.length, n = newLines.length;
+    const CONTEXT = (typeof context === 'number' && context >= 0) ? context : 1;
+    // Build LCS table
+    const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+    for (let i = m - 1; i >= 0; i--) {
+      for (let j = n - 1; j >= 0; j--) {
+        if (oldLines[i] === newLines[j]) {
+          dp[i][j] = 1 + dp[i + 1][j + 1];
+        } else {
+          dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
         }
       }
     }
+
+    // Trace back through LCS to produce edit operations
+    // Each op: { type: 'eq'|'del'|'ins', oldIdx?, newIdx?, text }
+    const ops = [];
+    let i = 0, j = 0;
+    while (i < m || j < n) {
+      if (i < m && j < n && oldLines[i] === newLines[j]) {
+        ops.push({ type: 'eq', oldIdx: i, newIdx: j, text: oldLines[i] });
+        i++; j++;
+      } else if (j < n && (i >= m || dp[i + 1][j] <= dp[i][j + 1])) {
+        ops.push({ type: 'ins', newIdx: j, text: newLines[j] });
+        j++;
+      } else {
+        ops.push({ type: 'del', oldIdx: i, text: oldLines[i] });
+        i++;
+      }
+    }
+
+    // Identify which op indices are changed (del or ins)
+    const changed = new Set();
+    for (let k = 0; k < ops.length; k++) {
+      if (ops[k].type !== 'eq') changed.add(k);
+    }
+
+    // Expand context window around changed ops
+    const inContext = new Set();
+    for (const k of changed) {
+      for (let c = Math.max(0, k - CONTEXT); c <= Math.min(ops.length - 1, k + CONTEXT); c++) {
+        inContext.add(c);
+      }
+    }
+
+    // Build output — collapse long runs of omitted context into @@ markers
+    const out = [];
+    let lastIncluded = -1;
+    for (let k = 0; k < ops.length; k++) {
+      if (!inContext.has(k)) continue;
+      if (lastIncluded >= 0 && k > lastIncluded + 1) {
+        const skipped = k - lastIncluded - 1;
+        out.push(`@@ -${(ops[lastIncluded].oldIdx ?? '?') + 1} +${skipped} lines skipped @@`);
+      }
+      const op = ops[k];
+      if (op.type === 'eq')  out.push(` ${op.text}`);
+      if (op.type === 'del') out.push(`-${op.text}`);
+      if (op.type === 'ins') out.push(`+${op.text}`);
+      lastIncluded = k;
+    }
+
+    if (out.length === 0) return '(no changes)';
     return out.join('\n');
   }
 
-  async editFile(filePath, edits, dryRun = false, commitMessage) {
+  async editFile(filePath, edits, dryRun = false, commitMessage, context = 1) {
     await this.cloneOrPull();
     const content = await readFile(path.join(this.repoPath, filePath), 'utf-8');
     const lines = content.split('\n');
@@ -478,7 +542,7 @@ class OverleafGitClient {
       lines.splice(start, deleteCount, ...replacement);
     }
     const newContent = lines.join('\n');
-    const diff = this._diffLines(content.split('\n'), newContent.split('\n'));
+    const diff = this._diffLines(content.split('\n'), newContent.split('\n'), context);
     if (!dryRun) {
       await writeFile(path.join(this.repoPath, filePath), newContent, 'utf-8');
       await this.commitAndPush(filePath, commitMessage || `Edit ${filePath} via MCP (${edits.length} edit(s))`);
@@ -971,6 +1035,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             },
           },
           dryRun:        { type: 'boolean', description: 'Preview diff without writing (default: false)' },
+          context:       { type: 'integer', minimum: 0, description: 'Lines of context shown around each changed hunk in the returned diff (default: 2). Increase to verify edits landed correctly.' },
           commitMessage: commitMsgProp,
           projectName:   projectNameProp,
         },
@@ -1245,10 +1310,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'edit_file': {
         const c    = getProject(args.projectName);
-        const diff = await c.editFile(args.filePath, args.edits, args.dryRun ?? false, args.commitMessage);
+        const diff = await c.editFile(args.filePath, args.edits, args.dryRun ?? false, args.commitMessage, args.context ?? 1);
         return { content: [{ type: 'text', text: diff }] };
       }
-
       case 'read_lines': {
         const c = getProject(args.projectName);
         const { lines, from, to, total } = await c.readLines(args.filePath, args.start, args.end);
