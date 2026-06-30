@@ -838,9 +838,11 @@ function getProject(projectName = 'default') {
   const project = projectsConfig.projects[projectName];
   if (!project) throw new Error(`Project "${projectName}" not found in configuration`);
   return new OverleafGitClient(project.projectId, project.gitToken);
+}
 
 async function copyLinesBetweenFiles(sourceProjectName, sourceFilePath, start, end, destProjectName, destFilePath, insertAfterLine, commitMessage) {
   const sourceClient = getProject(sourceProjectName);
+
   const destClient    = sourceProjectName === destProjectName ? sourceClient : getProject(destProjectName);
 
   await sourceClient.cloneOrPull();
