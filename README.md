@@ -6,15 +6,16 @@ An MCP (Model Context Protocol) server that provides full read/write access to O
 
 ## Features
 
-- 📄 **File Management**: Create, read, copy, delete, and list files across your Overleaf projects.
-- ✍️ **Surgical Editing**: Read and write specific sections, subsections, and paragraphs without touching the rest of the document.
-- 🏗️ **Structural Control**: Move and insert sections or paragraphs to reorganise your paper atomically.
+- 📄 **File Management**: Create, read, copy, delete, and list files across your Overleaf projects. File creation never overwrites — collisions are auto-redirected to an incremented filename.
+- ✍️ **Surgical Editing**: Read and write specific sections, subsections, and paragraphs, or specific line ranges, without touching the rest of the document.
+- 🏗️ **Structural Control**: Move, copy, and insert sections, paragraphs, or raw line ranges — within a file or between two files/projects — to reorganise without ever rewriting whole documents.
 - ⚙️ **Preamble Management**: Isolate and edit document setup (packages, custom commands) safely.
 - 📚 **BibTeX Management**: Search entries by any field, retrieve by citation key, and replace individual entries in-place.
-- 🔍 **Semantic Search**: Search paragraphs by keywords to quickly find and edit relevant content.
+- 🔍 **Semantic Search**: Search paragraphs by keywords, or raw text by phrase, to quickly find and edit relevant content.
 - 🔁 **Paragraph Deduplication**: Automatically detect and rename duplicate `\paragraph{}` names.
 - 📊 **Project Summary**: Get an overview of project status and structure.
 - 🔄 **Auto-Sync**: Every write operation automatically pulls the latest state and pushes changes immediately to Overleaf.
+
 
 ## Installation
 
@@ -75,9 +76,25 @@ Restart Claude Desktop after configuration.
 | `status_summary` | Project overview: file count and heading breakdown |
 | `list_files` | List files (optional `extension`, default `.tex`; use `.bib` for bib files) |
 | `read_file` | Read a file's full contents |
-| `create_file` | Create a new file |
+| `create_file` | Create a new file. **Never overwrites** — if `filePath` already exists, content is saved instead to an incremented filename (`name (1).tex`, ...) and the response is flagged as an error pointing you at the line-reorganisation tools below to merge it in. |
 | `copy_file` | Copy a file server-side (no content passes through the agent) |
 | `delete_file` | Delete a file via `git rm` |
+
+### Lines & Raw Editing
+| Tool | Description |
+|---|---|
+| `edit_file` | Line-range replacements (multiple edits per call), returns a git-style diff, supports `dryRun` |
+| `replace_lines` | Replace a known line range directly |
+| `insert_lines` | Insert content after a given line number |
+| `delete_lines` | Delete a line range |
+| `append_to_file` | Append to the end of a file — always safe, used as the automatic fallback by `write_section` when the named heading doesn't exist yet |
+| `copy_lines` | Copy a line range and insert the copy elsewhere in the **same** file; originals preserved |
+| `move_lines` | Cut a line range and paste it elsewhere in the **same** file; throws if the destination falls inside the source range |
+| `copy_lines_between_files` | Copy a line range from one file into a **different** file (created if missing), optionally in a different project (`sourceProjectName`/`destProjectName`); source untouched |
+| `move_lines_between_files` | Cut a line range from one file into a **different** file/project; the destination is written and pushed first, and the block is only removed from the source after that succeeds, so a failed move never loses data |
+| `find_in_file` | Phrase search within one file (whitespace-normalized); returns `startLine`/`endLine` for chaining into the tools above |
+| `find_in_files` | Same, recursively across the project, with glob filtering |
+
 
 ### Preamble
 | Tool | Description |
@@ -90,7 +107,7 @@ Restart Claude Desktop after configuration.
 |---|---|
 | `get_sections` | List headings (optional `sectionType` filter) |
 | `get_section_content` | Read a named heading block |
-| `write_section` | Replace a heading block in-place. `newContent` must include the heading line. |
+| `write_section` | Replace a heading block in-place. `newContent` must include the heading line. If the named heading isn't found, falls back to safely appending the content to the end of the file instead of erroring — the response reports the exact start/end line numbers of the appended block so you can immediately reorganise it with `move_lines`. |
 | `move_section` | Atomically cut and splice a block before/after another |
 | `insert_section` | Insert a new block before/after a named heading |
 | `dedup_paragraphs` | Find and rename duplicate `\paragraph{}` names (supports `dryRun`) |
@@ -108,6 +125,11 @@ Restart Claude Desktop after configuration.
 | `search_paragraphs` | Search paragraphs by keywords; returns matches with section breadcrumb. `matchAll:true` for AND logic. |
 
 *All tools accept an optional `projectName` argument. Omit to use `"default"`.*
+
+## Recommended workflow
+
+Avoid rewriting whole documents. To build up a new file or merge content from elsewhere: `create_file` (or `append_to_file` on an existing file) to land the raw content, `find_in_file` to locate line numbers, then `copy_lines`/`move_lines`/`copy_lines_between_files`/`move_lines_between_files` to reorganise. Use `write_section`/`edit_file`/`replace_lines` only for targeted changes to existing structure.
+
 
 ## Heading Hierarchy
 
