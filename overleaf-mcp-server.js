@@ -6,7 +6,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { readFile, writeFile, mkdir, appendFile } from 'fs/promises';
+import { readFile, writeFile, mkdir, appendFile, access } from 'fs/promises';
 import { promisify } from 'util';
 import { exec as execCallback } from 'child_process';
 import path from 'path';
@@ -528,6 +528,11 @@ class OverleafGitClient {
   }
 
   async editFile(filePath, edits, dryRun = false, commitMessage, context = 1) {
+    edits.forEach((edit, i) => {
+      if (!Number.isFinite(edit.startLine)) {
+        throw new Error(`edit_file: edits[${i}].startLine is required and must be a number (got ${JSON.stringify(edit.startLine)}). Provide the line number where this edit should start.`);
+      }
+    });
     await this.cloneOrPull();
     const content = await readFile(path.join(this.repoPath, filePath), 'utf-8');
     const lines = content.split('\n');
@@ -578,6 +583,12 @@ class OverleafGitClient {
   }
 
   async replaceLines(filePath, start, end, newContent, commitMessage) {
+    if (!Number.isFinite(start)) {
+      throw new Error(`replace_lines: 'start' is required and must be a number (got ${JSON.stringify(start)}).`);
+    }
+    if (!Number.isFinite(end)) {
+      throw new Error(`replace_lines: 'end' is required and must be a number (got ${JSON.stringify(end)}).`);
+    }
     await this.cloneOrPull();
     const fullPath = path.join(this.repoPath, filePath);
     const content = await readFile(fullPath, 'utf-8');
@@ -594,6 +605,9 @@ class OverleafGitClient {
   }
 
   async insertLines(filePath, afterLine, content, commitMessage) {
+    if (!Number.isFinite(afterLine)) {
+      throw new Error(`insert_lines: 'after_line' is required and must be a number (got ${JSON.stringify(afterLine)}). Use 0 to insert at the beginning of the file.`);
+    }
     await this.cloneOrPull();
     const fullPath = path.join(this.repoPath, filePath);
     const existing = await readFile(fullPath, 'utf-8');
@@ -606,6 +620,12 @@ class OverleafGitClient {
   }
 
   async deleteLines(filePath, start, end, commitMessage) {
+    if (!Number.isFinite(start)) {
+      throw new Error(`delete_lines: 'start' is required and must be a number (got ${JSON.stringify(start)}).`);
+    }
+    if (!Number.isFinite(end)) {
+      throw new Error(`delete_lines: 'end' is required and must be a number (got ${JSON.stringify(end)}).`);
+    }
     await this.cloneOrPull();
     const fullPath = path.join(this.repoPath, filePath);
     const content = await readFile(fullPath, 'utf-8');
@@ -618,6 +638,45 @@ class OverleafGitClient {
     await this.commitAndPush(filePath, commitMessage || `Delete lines ${start}-${end} in ${filePath} via MCP`);
     return { deletedLines, total: lines.length };
   }
+
+  async copyLines(filePath, start, end, insertAfterLine, commitMessage) {
+    await this.cloneOrPull();
+    const fullPath = path.join(this.repoPath, filePath);
+    const content  = await readFile(fullPath, 'utf-8');
+    const lines    = content.split('\n');
+    const from     = Math.max(1, start) - 1;          // 0-indexed start
+    const blockLen = Math.min(end, lines.length) - from;
+    if (blockLen <= 0) throw new Error(`copy_lines: invalid range ${start}-${end}`);
+    const block    = lines.slice(from, from + blockLen);
+    const insertAt = Math.min(Math.max(0, insertAfterLine), lines.length);
+    lines.splice(insertAt, 0, ...block);
+    await writeFile(fullPath, lines.join('\n'), 'utf-8');
+    await this.commitAndPush(filePath, commitMessage || `Copy lines ${start}-${end} to after line ${insertAfterLine} in ${filePath} via MCP`);
+    return { copiedLines: blockLen, insertedAfter: insertAfterLine, total: lines.length };
+  }
+
+  async moveLines(filePath, start, end, insertAfterLine, commitMessage) {
+    await this.cloneOrPull();
+    const fullPath = path.join(this.repoPath, filePath);
+    const content  = await readFile(fullPath, 'utf-8');
+    const lines    = content.split('\n');
+    const from     = Math.max(1, start) - 1;
+    const blockLen = Math.min(end, lines.length) - from;
+    if (blockLen <= 0) throw new Error(`move_lines: invalid range ${start}-${end}`);
+    if (insertAfterLine >= start && insertAfterLine <= end)
+      throw new Error(`move_lines: insertAfterLine (${insertAfterLine}) is inside the source range (${start}-${end})`);
+    const block = lines.splice(from, blockLen);  // remove block
+    // Adjust destination for the removal
+    const insertAt = insertAfterLine > from
+      ? Math.max(from, insertAfterLine - blockLen)
+      : insertAfterLine;
+    lines.splice(insertAt, 0, ...block);
+    await writeFile(fullPath, lines.join('\n'), 'utf-8');
+    await this.commitAndPush(filePath, commitMessage || `Move lines ${start}-${end} to after line ${insertAfterLine} in ${filePath} via MCP`);
+    return { movedLines: blockLen, insertedAfter: insertAt, total: lines.length };
+  }
+
+
 
   async appendToFile(filePath, content, commitMessage) {
     await this.cloneOrPull();
@@ -657,9 +716,46 @@ class OverleafGitClient {
     return results;
   }
 
-  async createFile(filePath, content = '', commitMessage = 'Create file via MCP') {
-    return this.writeRaw(filePath, content, commitMessage);
+  async _pathExists(relFilePath) {
+    await this.cloneOrPull();
+    try {
+      await access(path.join(this.repoPath, relFilePath));
+      return true;
+    } catch {
+      return false;
+    }
   }
+
+  // Finds the next available "name (1).ext", "name (2).ext", ... path that does
+  // not collide with an existing file in the project. Never overwrites.
+  async findAvailablePath(relFilePath) {
+    if (!(await this._pathExists(relFilePath))) return relFilePath;
+    const dir  = path.dirname(relFilePath);
+    const ext  = path.extname(relFilePath);
+    const base = path.basename(relFilePath, ext);
+    let n = 1;
+    let candidate;
+    do {
+      candidate = dir === '.' ? `${base} (${n})${ext}` : path.join(dir, `${base} (${n})${ext}`);
+      n++;
+    } while (await this._pathExists(candidate));
+    return candidate;
+  }
+
+  // Creates a file. NEVER overwrites an existing one — if filePath already
+  // exists, writes to an incremented filename instead and reports the redirect.
+  async createFile(filePath, content = '', commitMessage = 'Create file via MCP') {
+    const existed = await this._pathExists(filePath);
+    if (!existed) {
+      const result = await this.writeRaw(filePath, content, commitMessage);
+      return { message: result, path: filePath, redirected: false };
+    }
+    const altPath = await this.findAvailablePath(filePath);
+    const result  = await this.writeRaw(altPath, content, commitMessage || `Create ${altPath} via MCP`);
+    return { message: result, path: altPath, redirected: true, originalPath: filePath };
+  }
+
+
 
   async copyFile(srcPath, destPath, commitMessage) {
     const content = await this.readRaw(srcPath);
@@ -742,7 +838,74 @@ function getProject(projectName = 'default') {
   const project = projectsConfig.projects[projectName];
   if (!project) throw new Error(`Project "${projectName}" not found in configuration`);
   return new OverleafGitClient(project.projectId, project.gitToken);
+
+async function copyLinesBetweenFiles(sourceProjectName, sourceFilePath, start, end, destProjectName, destFilePath, insertAfterLine, commitMessage) {
+  const sourceClient = getProject(sourceProjectName);
+  const destClient    = sourceProjectName === destProjectName ? sourceClient : getProject(destProjectName);
+
+  await sourceClient.cloneOrPull();
+  const sourceFullPath = path.join(sourceClient.repoPath, sourceFilePath);
+  const sourceContent  = await readFile(sourceFullPath, 'utf-8');
+  const sourceLines    = sourceContent.split('\n');
+  const from           = Math.max(1, start) - 1;
+  const blockLen       = Math.min(end, sourceLines.length) - from;
+  if (blockLen <= 0) throw new Error(`copy_lines_between_files: invalid range ${start}-${end}`);
+  const block          = sourceLines.slice(from, from + blockLen);
+
+  await destClient.cloneOrPull();
+  const destFullPath = path.join(destClient.repoPath, destFilePath);
+  let destLines;
+  try {
+    const destContent = await readFile(destFullPath, 'utf-8');
+    destLines = destContent.split('\n');
+  } catch (err) {
+    if (err.code === 'ENOENT') destLines = [''];
+    else throw err;
+  }
+  const insertAt = Math.min(Math.max(0, insertAfterLine), destLines.length);
+  destLines.splice(insertAt, 0, ...block);
+
+  await writeFile(destFullPath, destLines.join('\n'), 'utf-8');
+  await destClient.commitAndPush(destFilePath, commitMessage || `Copy lines ${start}-${end} from ${sourceFilePath} into ${destFilePath} via MCP`);
+  return { copiedLines: blockLen, insertedAfter: insertAfterLine, destTotal: destLines.length };
 }
+
+async function moveLinesBetweenFiles(sourceProjectName, sourceFilePath, start, end, destProjectName, destFilePath, insertAfterLine, commitMessage) {
+  const sourceClient = getProject(sourceProjectName);
+  const destClient    = sourceProjectName === destProjectName ? sourceClient : getProject(destProjectName);
+
+  await sourceClient.cloneOrPull();
+  const sourceFullPath = path.join(sourceClient.repoPath, sourceFilePath);
+  const sourceContent  = await readFile(sourceFullPath, 'utf-8');
+  const sourceLines    = sourceContent.split('\n');
+  const from           = Math.max(1, start) - 1;
+  const blockLen       = Math.min(end, sourceLines.length) - from;
+  if (blockLen <= 0) throw new Error(`move_lines_between_files: invalid range ${start}-${end}`);
+  const block          = sourceLines.splice(from, blockLen);
+
+  await destClient.cloneOrPull();
+  const destFullPath = path.join(destClient.repoPath, destFilePath);
+  let destLines;
+  try {
+    const destContent = await readFile(destFullPath, 'utf-8');
+    destLines = destContent.split('\n');
+  } catch (err) {
+    if (err.code === 'ENOENT') destLines = [''];
+    else throw err;
+  }
+  const insertAt = Math.min(Math.max(0, insertAfterLine), destLines.length);
+  destLines.splice(insertAt, 0, ...block);
+
+  // Write + push destination first; only remove from source after dest succeeds (avoid data loss)
+  await writeFile(destFullPath, destLines.join('\n'), 'utf-8');
+  await destClient.commitAndPush(destFilePath, commitMessage || `Copy lines ${start}-${end} from ${sourceFilePath} into ${destFilePath} via MCP`);
+
+  await writeFile(sourceFullPath, sourceLines.join('\n'), 'utf-8');
+  await sourceClient.commitAndPush(sourceFilePath, commitMessage || `Remove moved lines ${start}-${end} from ${sourceFilePath} via MCP`);
+
+  return { movedLines: blockLen, insertedAfter: insertAfterLine, destTotal: destLines.length, sourceTotal: sourceLines.length };
+}
+
 
 const filePathProp    = { type: 'string', description: 'Path to the file (relative to project root)' };
 const projectNameProp = { type: 'string', description: 'Project identifier (optional, defaults to "default")' };
@@ -799,7 +962,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'create_file',
-      description: 'Create a new file in the project and push it to Overleaf',
+      description: 'Create a new file in the project and push it to Overleaf. NEVER overwrites an existing file — if filePath already exists, the content is automatically saved instead to an incremented filename (e.g. "name (1).tex"), and the response flags this.', 
       inputSchema: {
         type: 'object',
         properties: {
@@ -1118,6 +1281,75 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'copy_lines',
+      description: 'Copy a range of lines and insert the copy after a given line number. Original lines are preserved. Use with move_lines to reorganise content without rewriting.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:        filePathProp,
+          start:           { type: 'integer', minimum: 1, description: 'First line of the block to copy (1-indexed, inclusive)' },
+          end:             { type: 'integer', description: 'Last line of the block to copy (1-indexed, inclusive)' },
+          insertAfterLine: { type: 'integer', minimum: 0, description: 'Insert the copied block after this line number. Use 0 to insert at the very beginning.' },
+          commitMessage:   commitMsgProp,
+          projectName:     projectNameProp,
+        },
+        required: ['filePath', 'start', 'end', 'insertAfterLine'],
+      },
+    },
+    {
+      name: 'move_lines',
+      description: 'Move a range of lines to after a given line number (cut and paste). Line numbers are adjusted automatically for the removal. Throws if insertAfterLine falls inside the source range.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:        filePathProp,
+          start:           { type: 'integer', minimum: 1, description: 'First line of the block to move (1-indexed, inclusive)' },
+          end:             { type: 'integer', description: 'Last line of the block to move (1-indexed, inclusive)' },
+          insertAfterLine: { type: 'integer', minimum: 0, description: 'Insert the block after this line number in the post-removal file. Use 0 to move to the very beginning.' },
+          commitMessage:   commitMsgProp,
+          projectName:     projectNameProp,
+        },
+        required: ['filePath', 'start', 'end', 'insertAfterLine'],
+      },
+    },
+    {
+      name: 'copy_lines_between_files',
+      description: 'Copy a range of lines from one file and insert the copy into a different file after a given line number. Original lines in the source are preserved. Source and destination can be in the same or different Overleaf projects. Use to combine content from two files without manually rewriting either.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          sourceFilePath:   filePathProp,
+          sourceProjectName: { type: 'string', description: 'Source project identifier (optional, defaults to "default")' },
+          start:            { type: 'integer', minimum: 1, description: 'First line of the block to copy in the source file (1-indexed, inclusive)' },
+          end:              { type: 'integer', description: 'Last line of the block to copy in the source file (1-indexed, inclusive)' },
+          destFilePath:     { type: 'string', description: 'Destination file path (relative to destination project root). Created if it does not exist.' },
+          destProjectName:  { type: 'string', description: 'Destination project identifier (optional, defaults to "default")' },
+          insertAfterLine:  { type: 'integer', minimum: 0, description: 'Insert the copied block after this line number in the destination file. Use 0 to insert at the very beginning.' },
+          commitMessage:    commitMsgProp,
+        },
+        required: ['sourceFilePath', 'start', 'end', 'destFilePath', 'insertAfterLine'],
+      },
+    },
+    {
+      name: 'move_lines_between_files',
+      description: 'Move (cut and paste) a range of lines from one file into a different file after a given line number. The lines are removed from the source file. Source and destination can be in the same or different Overleaf projects. Use to combine or split files without manually rewriting either.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          sourceFilePath:   filePathProp,
+          sourceProjectName: { type: 'string', description: 'Source project identifier (optional, defaults to "default")' },
+          start:            { type: 'integer', minimum: 1, description: 'First line of the block to move in the source file (1-indexed, inclusive)' },
+          end:              { type: 'integer', description: 'Last line of the block to move in the source file (1-indexed, inclusive)' },
+          destFilePath:     { type: 'string', description: 'Destination file path (relative to destination project root). Created if it does not exist.' },
+          destProjectName:  { type: 'string', description: 'Destination project identifier (optional, defaults to "default")' },
+          insertAfterLine:  { type: 'integer', minimum: 0, description: 'Insert the block after this line number in the destination file. Use 0 to insert at the very beginning.' },
+          commitMessage:    commitMsgProp,
+        },
+        required: ['sourceFilePath', 'start', 'end', 'destFilePath', 'insertAfterLine'],
+      },
+    },
+
+    {
       name: 'append_to_file',
       description: 'Append content to the end of a file and push. More efficient than write_section when you just need to add to the end.',
       inputSchema: {
@@ -1221,8 +1453,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'create_file': {
         const c = getProject(args.projectName);
-        return { content: [{ type: 'text', text: await c.createFile(args.filePath, args.content || '', args.commitMessage || `Create ${args.filePath} via MCP`) }] };
+        const result = await c.createFile(args.filePath, args.content || '', args.commitMessage || `Create ${args.filePath} via MCP`);
+        if (result.redirected) {
+          const text = `File "${result.originalPath}" already exists — nothing was overwritten. Content was saved instead to "${result.path}". If you intended to add this content to the existing file, use copy_lines_between_files or move_lines_between_files (or append_to_file / write_section) to insert it from "${result.path}" into "${result.originalPath}", then delete "${result.path}" once merged.`;
+          return { content: [{ type: 'text', text }], isError: true };
+        }
+        return { content: [{ type: 'text', text: result.message }] };
       }
+
 
       case 'copy_file': {
         const c = getProject(args.projectName);
@@ -1261,7 +1499,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'write_section': {
         const c = getProject(args.projectName);
-        return { content: [{ type: 'text', text: await c.writeSection(args.filePath, args.sectionTitle, args.newContent, args.sectionType || null, args.commitMessage) }] };
+        try {
+          return { content: [{ type: 'text', text: await c.writeSection(args.filePath, args.sectionTitle, args.newContent, args.sectionType || null, args.commitMessage) }] };
+        } catch (err) {
+          if (err.message && err.message.includes('not found')) {
+            // Heading absent — safe fallback: append to end of file
+            // Read current line count first so we can report the exact range
+            const existingContent = await c.readRaw(args.filePath);
+            const existingLines   = existingContent.split('\n').length;
+            const appendedLines   = ('\n' + args.newContent).split('\n').length - 1;
+            const startLine       = existingLines + 1;
+            const endLine         = existingLines + appendedLines;
+            await c.appendToFile(args.filePath, '\n' + args.newContent, args.commitMessage || `Append "${args.sectionTitle}" via MCP`);
+            return { content: [{ type: 'text', text: `[write_section fallback: heading "${args.sectionTitle}" not found — content appended to end of file. Starts at line ${startLine}, ends at line ${endLine}.]` }] };
+          }
+          throw err;
+        }
       }
 
       case 'move_section': {
@@ -1361,6 +1614,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await c.deleteLines(args.filePath, args.start, args.end, args.commitMessage);
         return { content: [{ type: 'text', text: `Deleted ${result.deletedLines} lines. File now has ${result.total} lines.` }] };
       }
+
+      case 'copy_lines': {
+        const c      = getProject(args.projectName);
+        const result = await c.copyLines(args.filePath, args.start, args.end, args.insertAfterLine, args.commitMessage);
+        const startLine = result.insertedAfter + 1;
+        const endLine   = result.insertedAfter + result.copiedLines;
+        return { content: [{ type: 'text', text: `Copied ${result.copiedLines} lines. Inserted copy starts at line ${startLine}, ends at line ${endLine}. File now has ${result.total} lines.` }] };
+      }
+
+      case 'move_lines': {
+        const c      = getProject(args.projectName);
+        const result = await c.moveLines(args.filePath, args.start, args.end, args.insertAfterLine, args.commitMessage);
+        const startLine = result.insertedAfter + 1;
+        const endLine   = result.insertedAfter + result.movedLines;
+        return { content: [{ type: 'text', text: `Moved ${result.movedLines} lines. Block now starts at line ${startLine}, ends at line ${endLine}. File now has ${result.total} lines.` }] };
+      }
+
+      case 'copy_lines_between_files': {
+        const result = await copyLinesBetweenFiles(
+          args.sourceProjectName, args.sourceFilePath, args.start, args.end,
+          args.destProjectName, args.destFilePath, args.insertAfterLine, args.commitMessage
+        );
+        const startLine = result.insertedAfter + 1;
+        const endLine   = result.insertedAfter + result.copiedLines;
+        return { content: [{ type: 'text', text: `Copied ${result.copiedLines} lines from ${args.sourceFilePath} into ${args.destFilePath}. Inserted block starts at line ${startLine}, ends at line ${endLine}. ${args.destFilePath} now has ${result.destTotal} lines.` }] };
+      }
+
+      case 'move_lines_between_files': {
+        const result = await moveLinesBetweenFiles(
+          args.sourceProjectName, args.sourceFilePath, args.start, args.end,
+          args.destProjectName, args.destFilePath, args.insertAfterLine, args.commitMessage
+        );
+        const startLine = result.insertedAfter + 1;
+        const endLine   = result.insertedAfter + result.movedLines;
+        return { content: [{ type: 'text', text: `Moved ${result.movedLines} lines from ${args.sourceFilePath} into ${args.destFilePath}. Inserted block starts at line ${startLine}, ends at line ${endLine}. ${args.destFilePath} now has ${result.destTotal} lines; ${args.sourceFilePath} now has ${result.sourceTotal} lines.` }] };
+      }
+
 
       case 'append_to_file': {
         const c = getProject(args.projectName);
