@@ -774,6 +774,387 @@ class OverleafGitClient {
     );
     return `"${filePath}" deleted and pushed.\n${stdout}`;
   }
+
+  // ── Cross-reference / dependency graph ────────────────────────────────────
+  //
+  // Recursively follows \input{}/\include{} from a root file and builds a
+  // full picture of labels, references, citations, bibliographies, included
+  // files, and images in a single pass — far cheaper than an LLM reading the
+  // whole document tree to answer "is this label used anywhere?".
+  async analyzeDocumentDependencies(rootFilePath) {
+    await this.cloneOrPull();
+
+    const visited       = new Set();
+    const missingFiles   = [];
+    const labels         = [];   // { label, file, line }
+    const refs           = [];   // { label, command, file, line }
+    const citeKeys       = [];   // { key, file, line }
+    const includedFiles  = [];   // { path, file, line }
+    const images         = [];   // { path, file, line }
+    const bibFiles       = new Set();
+
+    const resolveIncludePath = (incPath, baseDir) => {
+      let p = incPath.trim();
+      if (!p.endsWith('.tex')) p += '.tex';
+      return path.normalize(path.join(baseDir, p));
+    };
+
+    const processFile = async (relPath) => {
+      const absPath = path.normalize(path.join(this.repoPath, relPath));
+      const relKey  = path.relative(this.repoPath, absPath);
+      if (visited.has(relKey)) return;
+      visited.add(relKey);
+
+      let content;
+      try {
+        content = await readFile(absPath, 'utf-8');
+      } catch {
+        missingFiles.push(relKey);
+        return;
+      }
+      const lineOf = (idx) => content.substring(0, idx).split('\n').length;
+      let m;
+
+      const labelRe = /\\label\{([^}]+)\}/g;
+      while ((m = labelRe.exec(content)) !== null) {
+        labels.push({ label: m[1], file: relKey, line: lineOf(m.index) });
+      }
+
+      const refRe = /\\(ref|eqref|autoref|cref|Cref|pageref|nameref)\{([^}]+)\}/g;
+      while ((m = refRe.exec(content)) !== null) {
+        for (const k of m[2].split(',').map(s => s.trim())) {
+          refs.push({ label: k, command: m[1], file: relKey, line: lineOf(m.index) });
+        }
+      }
+
+      const citeRe = /\\cite[a-zA-Z]*\*?(?:\[[^\]]*\])?(?:\[[^\]]*\])?\{([^}]+)\}/g;
+      while ((m = citeRe.exec(content)) !== null) {
+        for (const k of m[1].split(',').map(s => s.trim())) {
+          citeKeys.push({ key: k, file: relKey, line: lineOf(m.index) });
+        }
+      }
+
+      const bibRe = /\\(?:bibliography|addbibresource)\{([^}]+)\}/g;
+      while ((m = bibRe.exec(content)) !== null) {
+        for (const n of m[1].split(',').map(s => s.trim())) {
+          const bn = n.endsWith('.bib') ? n : n + '.bib';
+          bibFiles.add(path.normalize(path.join(path.dirname(relKey), bn)));
+        }
+      }
+
+      const imgRe = /\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}/g;
+      while ((m = imgRe.exec(content)) !== null) {
+        images.push({ path: m[1], file: relKey, line: lineOf(m.index) });
+      }
+
+      const incRe = /\\(?:input|include)\{([^}]+)\}/g;
+      const includesHere = [];
+      while ((m = incRe.exec(content)) !== null) {
+        includesHere.push(m[1]);
+        includedFiles.push({ path: m[1], file: relKey, line: lineOf(m.index) });
+      }
+      for (const inc of includesHere) {
+        const nextRel = path.relative(this.repoPath, resolveIncludePath(inc, path.dirname(absPath)));
+        await processFile(nextRel);
+      }
+    };
+
+    await processFile(rootFilePath);
+
+    // Resolve which citation keys actually exist in the referenced .bib files
+    const bibKeysAvailable = new Set();
+    const missingBibFiles  = [];
+    for (const bibRel of bibFiles) {
+      try {
+        const bibContent = await readFile(path.join(this.repoPath, bibRel), 'utf-8');
+        for (const e of this._parseBibEntries(bibContent)) bibKeysAvailable.add(e.key.toLowerCase());
+      } catch {
+        missingBibFiles.push(bibRel);
+      }
+    }
+
+    const labelSet    = new Set(labels.map(l => l.label));
+    const refLabelSet = new Set(refs.map(r => r.label));
+
+    // find_unused_labels: defined but never \ref'd anywhere in the tree
+    const unusedLabels = labels.filter(l => !refLabelSet.has(l.label));
+
+    // find_missing_references: \ref'd but no matching \label exists
+    const missingReferences = refs.filter(r => !labelSet.has(r.label));
+
+    // duplicate \label{} definitions (same name defined more than once — a real LaTeX bug)
+    const labelCount = {};
+    for (const l of labels) labelCount[l.label] = (labelCount[l.label] || 0) + 1;
+    const duplicateLabels = Object.entries(labelCount)
+      .filter(([, count]) => count > 1)
+      .map(([label, count]) => ({ label, count, occurrences: labels.filter(l => l.label === label) }));
+
+    // find_duplicate_citations: same key cited more than once within a single \cite{...} call
+    const duplicateCitationsInCall = [];
+    // Derived from citeKeys grouped by (file, line) since each match shares file+line
+    const byCall = {};
+
+    for (const c of citeKeys) {
+      const k = `${c.file}:${c.line}`;
+      (byCall[k] ||= []).push(c.key);
+    }
+    for (const [loc, keys] of Object.entries(byCall)) {
+      const seen = new Set();
+      const dups = new Set();
+      for (const k of keys) { if (seen.has(k)) dups.add(k); seen.add(k); }
+      if (dups.size > 0) {
+        const [file, line] = loc.split(':');
+        duplicateCitationsInCall.push({ file, line: Number(line), duplicateKeys: [...dups] });
+      }
+    }
+
+    // missing citations: \cite'd key with no matching BibTeX entry in any referenced .bib file
+    const missingCitations = bibFiles.size > 0
+      ? citeKeys.filter(c => !bibKeysAvailable.has(c.key.toLowerCase()))
+      : [];
+
+    // figures without a \label (so they can't be \ref'd at all) — a likely-unintentional figure
+    const FIGURE_ENV_RE = /\\begin\{figure\*?\}([\s\S]*?)\\end\{figure\*?\}/g;
+    const figuresWithoutLabel = [];
+    for (const relKey of visited) {
+      const absPath = path.join(this.repoPath, relKey);
+      let content;
+      try { content = await readFile(absPath, 'utf-8'); } catch { continue; }
+      let fm;
+      while ((fm = FIGURE_ENV_RE.exec(content)) !== null) {
+        if (!/\\label\{/.test(fm[1])) {
+          const line = content.substring(0, fm.index).split('\n').length;
+          figuresWithoutLabel.push({ file: relKey, line });
+        }
+      }
+    }
+
+    return {
+      rootFile: rootFilePath,
+      filesScanned: [...visited],
+      missingIncludedFiles: missingFiles,
+      counts: {
+        labels: labels.length,
+        refs: refs.length,
+        citations: citeKeys.length,
+        bibFiles: bibFiles.size,
+        includedFiles: includedFiles.length,
+        images: images.length,
+      },
+      unusedLabels,
+      missingReferences,
+      duplicateLabels,
+      duplicateCitationsInCall,
+      missingCitations,
+      figuresWithoutLabel,
+      bibFiles: [...bibFiles],
+      missingBibFiles,
+      includedFiles,
+      images,
+    };
+  }
+
+  // ── Python-aware editing ──────────────────────────────────────────────────
+  // Mirrors the JS-aware tools (list/get/replace function, get/replace/add
+  // imports) but for Python, where blocks are delimited by indentation rather
+  // than braces. Lets you grab or replace a function/class by name, or manage
+  // the import block, without reading or rewriting the whole file.
+
+  _detectPyDef(line) {
+    const m = line.match(/^(\s*)(?:async\s+)?(def|class)\s+([A-Za-z_]\w*)/);
+    return m ? { indent: m[1].length, type: m[2], name: m[3] } : null;
+  }
+
+  _pyIndentOf(line) {
+    const m = line.match(/^[ \t]*/);
+    return m ? m[0].length : 0;
+  }
+
+  // Given the line index of a `def`/`class` line, returns the full block
+  // range [start, end] (0-indexed, inclusive) — including any decorator
+  // lines directly above, and the indented body below, ending where
+  // indentation returns to <= the def's own indentation.
+  _pyBlockRange(lines, defIdx) {
+    const def = this._detectPyDef(lines[defIdx]);
+    const indent = def.indent;
+
+    let start = defIdx;
+    let j = defIdx - 1;
+    while (j >= 0) {
+      const t = lines[j].trim();
+      if (t.startsWith('@') && this._pyIndentOf(lines[j]) === indent) {
+        start = j;
+        j--;
+      } else {
+        break;
+      }
+    }
+
+    let end = lines.length - 1;
+    for (let k = defIdx + 1; k < lines.length; k++) {
+      const t = lines[k].trim();
+      if (t === '' || t.startsWith('#')) continue; // blank/comment lines don't end the block
+      if (this._pyIndentOf(lines[k]) <= indent) { end = k - 1; break; }
+    }
+    while (end > start && lines[end].trim() === '') end--; // trim trailing blank lines
+
+    return { start, end, indent, type: def.type, name: def.name };
+  }
+
+  async listPyFunctions(filePath) {
+    const content = await this.readRaw(filePath);
+    const lines   = content.split('\n');
+    const results = [];
+    for (let i = 0; i < lines.length; i++) {
+      const def = this._detectPyDef(lines[i]);
+      if (!def) continue;
+      const { start, end } = this._pyBlockRange(lines, i);
+      results.push({ name: def.name, type: def.type, indent: def.indent, startLine: start + 1, endLine: end + 1 });
+    }
+    return results;
+  }
+
+  async getPyFunction(filePath, name) {
+    const content = await this.readRaw(filePath);
+    const lines   = content.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const def = this._detectPyDef(lines[i]);
+      if (def && def.name === name) {
+        const { start, end } = this._pyBlockRange(lines, i);
+        return { startLine: start + 1, endLine: end + 1, content: lines.slice(start, end + 1).join('\n') };
+      }
+    }
+    throw new Error(`Could not find Python def/class: ${name}`);
+  }
+
+  async replacePyFunction(filePath, name, newContent, commitMessage) {
+    const content = await this.readRaw(filePath);
+    const lines   = content.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const def = this._detectPyDef(lines[i]);
+      if (def && def.name === name) {
+        const { start, end } = this._pyBlockRange(lines, i);
+        const newLines = newContent.split('\n');
+        lines.splice(start, end - start + 1, ...newLines);
+        const updated = lines.join('\n');
+        await this.writeRaw(filePath, updated, commitMessage || `Replace Python def/class "${name}" via MCP`);
+        return { replacedLines: end - start + 1, newLines: newLines.length };
+      }
+    }
+    throw new Error(`Could not find Python def/class: ${name}`);
+  }
+
+  _isPyImportLine(t) {
+    return /^(import\s+\S|from\s+\S+\s+import\b)/.test(t);
+  }
+
+  async getPyImports(filePath) {
+    const content = await this.readRaw(filePath);
+    const lines   = content.split('\n');
+    const imports = [];
+    let lastImportLine = 0;
+    let parenDepth = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const t = lines[i].trim();
+      if (parenDepth > 0) {
+        imports.push({ line: i + 1, text: lines[i] });
+        lastImportLine = i + 1;
+        parenDepth += (t.match(/\(/g) || []).length - (t.match(/\)/g) || []).length;
+        continue;
+      }
+      if (this._isPyImportLine(t)) {
+        imports.push({ line: i + 1, text: lines[i] });
+        lastImportLine = i + 1;
+        parenDepth += (t.match(/\(/g) || []).length - (t.match(/\)/g) || []).length;
+      }
+    }
+    return { imports, lastImportLine };
+  }
+
+  // Replaces the contiguous import block at the top of the file (skipping
+  // leading shebang/comment/blank lines, and following multi-line
+  // `from x import (...)` parenthesized blocks).
+  async replacePyImports(filePath, newImportsContent, commitMessage) {
+    const content = await this.readRaw(filePath);
+    const lines   = content.split('\n');
+    let start = -1, end = -1, parenDepth = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const t = lines[i].trim();
+      if (parenDepth > 0) {
+        end = i;
+        parenDepth += (t.match(/\(/g) || []).length - (t.match(/\)/g) || []).length;
+        continue;
+      }
+      if (start === -1 && (t === '' || t.startsWith('#'))) continue; // skip leading blank/comment lines
+      if (this._isPyImportLine(t)) {
+        if (start === -1) start = i;
+        end = i;
+        parenDepth += (t.match(/\(/g) || []).length - (t.match(/\)/g) || []).length;
+      } else {
+        break; // first non-import, non-leading-comment line ends (or precludes) the block
+      }
+    }
+    if (start === -1) throw new Error('No import block found at the top of the file.');
+    const newLines = newImportsContent.split('\n');
+    lines.splice(start, end - start + 1, ...newLines);
+    const updated = lines.join('\n');
+    await this.writeRaw(filePath, updated, commitMessage || 'Replace Python imports via MCP');
+    return { start: start + 1, end: end + 1, newLines: newLines.length };
+  }
+
+  async addPyImport(filePath, importStatement, commitMessage) {
+    const content = await this.readRaw(filePath);
+    const lines   = content.split('\n');
+    const normNew = importStatement.trim().replace(/\s+/g, ' ');
+    if (lines.some(l => l.trim().replace(/\s+/g, ' ') === normNew)) {
+      return { alreadyPresent: true, line: null };
+    }
+    let lastImportIdx = -1, parenDepth = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const t = lines[i].trim();
+      if (parenDepth > 0) {
+        lastImportIdx = i;
+        parenDepth += (t.match(/\(/g) || []).length - (t.match(/\)/g) || []).length;
+        continue;
+      }
+      if (this._isPyImportLine(t)) {
+        lastImportIdx = i;
+        parenDepth += (t.match(/\(/g) || []).length - (t.match(/\)/g) || []).length;
+      }
+    }
+    const insertAt = lastImportIdx >= 0 ? lastImportIdx + 1 : 0;
+    lines.splice(insertAt, 0, importStatement.trimEnd());
+    const updated = lines.join('\n');
+    await this.writeRaw(filePath, updated, commitMessage || 'Add Python import via MCP');
+    return { alreadyPresent: false, line: insertAt + 1 };
+  }
+
+  async checkSyntax(filePath) {
+    await this.cloneOrPull();
+    const fullPath = path.join(this.repoPath, filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    try {
+      if (['.js', '.mjs', '.cjs'].includes(ext)) {
+        await exec(`node --check "${fullPath}"`, { env: process.env });
+        return { ok: true, message: `OK — no syntax errors in ${filePath}` };
+      } else if (ext === '.py') {
+        await exec(`python3 -c "import ast,sys; ast.parse(open(sys.argv[1], encoding='utf-8').read(), sys.argv[1])" "${fullPath}"`, { env: process.env });
+        return { ok: true, message: `OK — no syntax errors in ${filePath}` };
+      } else if (ext === '.json') {
+        const content = await readFile(fullPath, 'utf-8');
+        JSON.parse(content);
+        return { ok: true, message: `OK — valid JSON in ${filePath}` };
+      } else {
+        return { ok: false, message: `No syntax checker available for "${ext}" files. Supported: .js, .mjs, .cjs, .py, .json.` };
+      }
+    } catch (err) {
+      const detail = (err.stderr || err.message || String(err)).trim();
+      return { ok: false, message: `Syntax error in ${filePath}:\n\n${detail}` };
+    }
+  }
+
+
+
 }
 
 
@@ -830,7 +1211,7 @@ function _multilineSearch(lines, searchText, caseSensitive = false) {
 
 // ── MCP server ───────────────────────────────────────────────────────────────
 const server = new Server(
-  { name: 'overleaf-mcp-server', version: '1.10.0' },
+  { name: 'overleaf-mcp-server', version: '1.13.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -964,14 +1345,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'create_file',
-      description: 'Create a new file in the project and push it to Overleaf. NEVER overwrites an existing file — if filePath already exists, the content is automatically saved instead to an incremented filename (e.g. "name (1).tex"), and the response flags this.', 
+      description: 'Create a new empty file in the project and push it to Overleaf. Does NOT accept content — use append_to_file, copy_lines_between_files, or write_section to populate it after creation. Never overwrites an existing file — if filePath already exists, the response flags this.',
       inputSchema: {
         type: 'object',
         properties: {
-          filePath: filePathProp,
-          content: { type: 'string', description: 'Initial file content (optional)' },
+          filePath:      filePathProp,
           commitMessage: commitMsgProp,
-          projectName: projectNameProp,
+          projectName:   projectNameProp,
         },
         required: ['filePath'],
       },
@@ -1209,13 +1589,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'read_lines',
-      description: 'Read a specific range of lines from a file by line number, with line numbers shown. Use find_in_file first to locate the relevant line numbers.',
+      description: 'Read a specific range of lines from a file by line number, with line numbers shown. Use find_in_file first to locate the relevant line numbers. If \'end\' is omitted, defaults to start + 24 (25 lines) and warns.',
       inputSchema: {
         type: 'object',
         properties: {
           filePath:    filePathProp,
           start:       { type: 'integer', minimum: 1, description: 'First line to read (1-indexed)' },
-          end:         { type: 'integer', description: 'Last line to read (inclusive). Omit to read to end of file.' },
+          end:         { type: 'integer', description: 'Last line to read (inclusive). Omit to read 25 lines from start.' },
           projectName: projectNameProp,
         },
         required: ['filePath', 'start'],
@@ -1399,6 +1779,111 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['filePath', 'keywords'],
       },
     },
+
+    // ── Cross-reference / dependency analysis ────────────────────────────
+    {
+      name: 'analyze_document_dependencies',
+      description: 'Recursively follows \\input{}/\\include{} from a root .tex file and builds a full cross-reference graph in one pass: all \\label definitions, \\ref/\\eqref/\\cref/etc. usages, \\cite usages, referenced .bib files, included files, and \\includegraphics images. Derives: unusedLabels (defined but never referenced), missingReferences (referenced but no matching \\label), duplicateLabels (same label defined twice — a LaTeX bug), duplicateCitationsInCall (same key cited twice in one \\cite{}), missingCitations (cited but absent from the .bib file), and figuresWithoutLabel. Use this instead of reading the whole document tree to answer cross-reference questions \u2014 it does the scanning server-side in one call.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:    filePathProp,
+          projectName: projectNameProp,
+        },
+        required: ['filePath'],
+      },
+    },
+    {
+      name: 'check_syntax',
+      description: 'Validates a file\'s syntax using the real language parser — `node --check` for .js/.mjs/.cjs, Python\'s ast.parse for .py, JSON.parse for .json — and reports the exact line/column of any error. Read-only: never executes the file\'s code, only parses it. Run this after editing a file (especially after multi-step edits like insert_lines/move_lines/replace_lines) to catch brace, paren, or indentation mismatches immediately.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:    filePathProp,
+          projectName: projectNameProp,
+        },
+        required: ['filePath'],
+      },
+    },
+
+
+    // ── Python-aware editing ──────────────────────────────────────────────
+    {
+      name: 'list_py_functions',
+      description: 'List all top-level and nested def/class definitions in a Python file, with their line ranges (decorators included). Only works within allowed directories.',
+      inputSchema: {
+        type: 'object',
+        properties: { filePath: filePathProp, projectName: projectNameProp },
+        required: ['filePath'],
+      },
+    },
+    {
+      name: 'get_py_function',
+      description: 'Extract a named def or class from a Python file by name, returning its full source (including decorators) and line range. Block boundaries are determined by indentation. Use list_py_functions first to confirm the name if there could be duplicates across nested scopes.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:    filePathProp,
+          name:        { type: 'string', description: 'def or class name to extract' },
+          projectName: projectNameProp,
+        },
+        required: ['filePath', 'name'],
+      },
+    },
+    {
+      name: 'replace_py_function',
+      description: 'Replace a named def or class in a Python file by name. Finds the full block automatically via indentation \u2014 no need to know line numbers. newContent must include the full definition (decorators, def/class line, and body) at the correct indentation level.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:      filePathProp,
+          name:          { type: 'string', description: 'def or class name to replace' },
+          newContent:    { type: 'string', description: 'Full replacement including decorators, the def/class line, and body, correctly indented' },
+          commitMessage: commitMsgProp,
+          projectName:   projectNameProp,
+        },
+        required: ['filePath', 'name', 'newContent'],
+      },
+    },
+    {
+      name: 'get_py_imports',
+      description: 'Extract all import and from-import statements from a Python file, with line numbers. Handles multi-line parenthesized `from x import (...)` blocks. Use this to inspect dependencies before adding or modifying imports.',
+      inputSchema: {
+        type: 'object',
+        properties: { filePath: filePathProp, projectName: projectNameProp },
+        required: ['filePath'],
+      },
+    },
+    {
+      name: 'replace_py_imports',
+      description: 'Replace the entire contiguous import block at the top of a Python file (after any leading shebang/comments). Use get_py_imports first to see the current imports. newContent should contain only the new import statements.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:      filePathProp,
+          newContent:    { type: 'string', description: 'Full replacement import block' },
+          commitMessage: commitMsgProp,
+          projectName:   projectNameProp,
+        },
+        required: ['filePath', 'newContent'],
+      },
+    },
+    {
+      name: 'add_py_import',
+      description: 'Append a single import (or from-import) statement after the last existing import in a Python file. Idempotent \u2014 does nothing if the exact statement is already present. Use this instead of replace_py_imports when you only need to add one new dependency.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath:      filePathProp,
+          statement:     { type: 'string', description: "Full import statement to add, e.g. \"import numpy as np\" or \"from scipy import stats\"" },
+          commitMessage: commitMsgProp,
+          projectName:   projectNameProp,
+        },
+        required: ['filePath', 'statement'],
+      },
+    },
+
+
   ],
 }));
 
@@ -1455,13 +1940,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'create_file': {
         const c = getProject(args.projectName);
-        const result = await c.createFile(args.filePath, args.content || '', args.commitMessage || `Create ${args.filePath} via MCP`);
+        const result = await c.createFile(args.filePath, '', args.commitMessage || `Create ${args.filePath} via MCP`);
         if (result.redirected) {
-          const text = `File "${result.originalPath}" already exists — nothing was overwritten. Content was saved instead to "${result.path}". If you intended to add this content to the existing file, use copy_lines_between_files or move_lines_between_files (or append_to_file / write_section) to insert it from "${result.path}" into "${result.originalPath}", then delete "${result.path}" once merged.`;
+          const text = `File "${result.originalPath}" already exists — nothing was overwritten. Use copy_lines_between_files, move_lines_between_files, append_to_file, or write_section to add content to the existing file.`;
           return { content: [{ type: 'text', text }], isError: true };
         }
-        return { content: [{ type: 'text', text: result.message }] };
+        return { content: [{ type: 'text', text: `${result.message} File is empty — use append_to_file, copy_lines_between_files, or write_section to populate it.` }] };
       }
+
 
 
       case 'copy_file': {
@@ -1563,16 +2049,79 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: `${results.length} paragraph(s) matched.\n\n` + JSON.stringify(results, null, 2) }] };
       }
 
+      case 'analyze_document_dependencies': {
+        const c      = getProject(args.projectName);
+        const report = await c.analyzeDocumentDependencies(args.filePath);
+        return { content: [{ type: 'text', text: JSON.stringify(report, null, 2) }] };
+      }
+
+      case 'check_syntax': {
+        const c      = getProject(args.projectName);
+        const result = await c.checkSyntax(args.filePath);
+        return { content: [{ type: 'text', text: result.message }], isError: !result.ok };
+      }
+
+
+      case 'list_py_functions': {
+        const c = getProject(args.projectName);
+        const results = await c.listPyFunctions(args.filePath);
+        return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+      }
+
+      case 'get_py_function': {
+        const c = getProject(args.projectName);
+        const result = await c.getPyFunction(args.filePath, args.name);
+        return { content: [{ type: 'text', text: `Lines ${result.startLine}-${result.endLine}:\n\n${result.content}` }] };
+      }
+
+      case 'replace_py_function': {
+        const c = getProject(args.projectName);
+        const result = await c.replacePyFunction(args.filePath, args.name, args.newContent, args.commitMessage);
+        return { content: [{ type: 'text', text: `Replaced ${result.replacedLines} lines with ${result.newLines} lines for "${args.name}".` }] };
+      }
+
+      case 'get_py_imports': {
+        const c = getProject(args.projectName);
+        const result = await c.getPyImports(args.filePath);
+        const text = result.imports.length > 0
+          ? result.imports.map(i => `${i.line}: ${i.text}`).join('\n')
+          : 'No imports found';
+        return { content: [{ type: 'text', text }] };
+      }
+
+      case 'replace_py_imports': {
+        const c = getProject(args.projectName);
+        const result = await c.replacePyImports(args.filePath, args.newContent, args.commitMessage);
+        return { content: [{ type: 'text', text: `Replaced import block (lines ${result.start}-${result.end}) with ${result.newLines} lines.` }] };
+      }
+
+      case 'add_py_import': {
+        const c = getProject(args.projectName);
+        const result = await c.addPyImport(args.filePath, args.statement, args.commitMessage);
+        const text = result.alreadyPresent
+          ? `Import already present \u2014 nothing added.`
+          : `Added import at line ${result.line}.`;
+        return { content: [{ type: 'text', text }] };
+      }
+
+
+
       case 'edit_file': {
         const c    = getProject(args.projectName);
         const diff = await c.editFile(args.filePath, args.edits, args.dryRun ?? false, args.commitMessage, args.context ?? 1);
         return { content: [{ type: 'text', text: diff }] };
       }
       case 'read_lines': {
+        const DEFAULT_WINDOW = 25;
+        const usedDefault = args.end === undefined;
+        const end = usedDefault ? args.start + DEFAULT_WINDOW - 1 : args.end;
         const c = getProject(args.projectName);
-        const { lines, from, to, total } = await c.readLines(args.filePath, args.start, args.end);
+        const { lines, from, to, total } = await c.readLines(args.filePath, args.start, end);
         const numbered = lines.map((line, i) => `${from + i}: ${line}`).join('\n');
-        return { content: [{ type: 'text', text: `Lines ${from}-${to} of ${total}:\n${numbered}` }] };
+        const warning = usedDefault
+          ? `\n\n⚠️ No 'end' parameter supplied — defaulting to ${DEFAULT_WINDOW} lines (${from}-${to} of ${total}). Pass an explicit 'end' to read more.`
+          : '';
+        return { content: [{ type: 'text', text: `Lines ${from}-${to} of ${total}:\n${numbered}${warning}` }] };
       }
 
       case 'find_in_file': {
